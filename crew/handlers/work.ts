@@ -234,7 +234,7 @@ export async function execute(
 
   // Reset a task whose in_progress worker exited. The attempt for an
   // in_progress task was already consumed by the worker's task.start.
-  const resetInterruptedTask = (taskId: string, task: { attempt_count?: number } | undefined, why: string): ResetOutcome => {
+  const resetInterruptedTask = (taskId: string, task: { attempt_count?: number } | undefined): ResetOutcome => {
     if (!task) return "missing";
     if ((task.attempt_count ?? 0) >= config.work.maxAttemptsPerTask) {
       store.updateTask(cwd, taskId, {
@@ -253,7 +253,7 @@ export async function execute(
   // attempt_count was never persisted on the spawnAgents dispatch path, so
   // consume an attempt here or the maxAttemptsPerTask backstop is bypassed
   // and autonomous retries are bounded only by maxWaves.
-  const resetNeverStartedTask = (taskId: string, task: { attempt_count?: number } | undefined, why: string): ResetOutcome => {
+  const resetNeverStartedTask = (taskId: string, task: { attempt_count?: number } | undefined): ResetOutcome => {
     if (!task) return "missing";
     const nextAttempt = (task.attempt_count ?? 0) + 1;
     if (nextAttempt > config.work.maxAttemptsPerTask) {
@@ -285,7 +285,7 @@ export async function execute(
       } else if (task?.status === "blocked") {
         blocked.push(taskId);
       } else if (task?.status === "in_progress") {
-        const outcome = resetInterruptedTask(taskId, task, r.wasGracefullyShutdown ? "Graceful shutdown." : "");
+        const outcome = resetInterruptedTask(taskId, task);
         if (outcome === "blocked") {
           blocked.push(taskId);
         } else {
@@ -293,7 +293,7 @@ export async function execute(
             r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
         }
       } else if (task?.status === "todo") {
-        const outcome = resetNeverStartedTask(taskId, task, r.wasGracefullyShutdown ? "Graceful shutdown." : "");
+        const outcome = resetNeverStartedTask(taskId, task);
         if (outcome === "blocked") {
           blocked.push(taskId);
         } else {
@@ -309,14 +309,14 @@ export async function execute(
         } else if (task?.status === "blocked") {
           blocked.push(taskId);
         } else if (task?.status === "in_progress") {
-          const outcome = resetInterruptedTask(taskId, task, "Graceful shutdown.");
+          const outcome = resetInterruptedTask(taskId, task);
           if (outcome === "blocked") {
             blocked.push(taskId);
           } else {
             markIndeterminate(taskId, task.status, "Graceful shutdown.");
           }
         } else if (task?.status === "todo") {
-          const outcome = resetNeverStartedTask(taskId, task, "Graceful shutdown.");
+          const outcome = resetNeverStartedTask(taskId, task);
           if (outcome === "blocked") {
             blocked.push(taskId);
           } else {
@@ -334,7 +334,7 @@ export async function execute(
           store.appendTaskProgress(cwd, taskId, "system", `Worker failed: ${r.error ?? "Unknown error"}`);
           // Non-autonomous: previously left stuck in_progress forever; reset so
           // the next wave can retry (or block at max attempts).
-          const outcome = resetInterruptedTask(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
+          const outcome = resetInterruptedTask(taskId, task);
           if (outcome === "blocked") {
             blocked.push(taskId);
             continue;
@@ -343,7 +343,7 @@ export async function execute(
           // Worker crashed before claiming the task. Consume an attempt here
           // too — otherwise a crash-looping worker is bounded only by maxWaves,
           // never by maxAttemptsPerTask.
-          const outcome = resetNeverStartedTask(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
+          const outcome = resetNeverStartedTask(taskId, task);
           if (outcome === "blocked") {
             blocked.push(taskId);
             continue;

@@ -181,6 +181,47 @@ describe("crew/indeterminate receipts and crew idle", () => {
     expect(response.details.indeterminate ?? []).toEqual([]);
   });
 
+  it("repeated-wave boundary: never-started exits consume attempts until top-of-wave auto-block (max=1)", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+    const configModule = await import("../../crew/utils/config.ts");
+    const crewDir = path.join(dirs.cwd, ".pi", "messenger", "crew");
+    const config = configModule.loadCrewConfig(crewDir);
+
+    writeWorkerAgent(dirs.cwd);
+    fs.writeFileSync(path.join(crewDir, "config.json"), JSON.stringify({ work: { maxAttemptsPerTask: 1 } }));
+
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async () => [makeResult(task.id)]);
+
+    // Wave 1: never-started exit consumes the single attempt (nextAttempt 1,
+    // 1 > 1 is false, so the task stays todo — the NEXT wave blocks).
+    const wave1 = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+    expect(store.getTask(dirs.cwd, task.id)?.attempt_count).toBe(1);
+    expect(wave1.details.indeterminate ?? []).toEqual([task.id]);
+
+    // Wave 2: top-of-wave auto-block fires at attempt_count >= max; no extra
+    // worker dispatch happens.
+    const wave2 = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+    const reloaded = store.getTask(dirs.cwd, task.id);
+    expect(reloaded?.status).toBe("blocked");
+    expect(reloaded?.attempt_count).toBe(1);
+    expect(wave2.details.blocked ?? []).toEqual([task.id]);
+  });
+
   it("getLiveWorkers sees regular spawnAgents workers, not just lobby workers", async () => {
     const registry = await import("../../crew/registry.ts");
 

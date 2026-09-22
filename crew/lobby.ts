@@ -194,20 +194,24 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
           });
           logFeedEvent(cwd, worker.name, "task.block", worker.assignedTaskId, `Max attempts reached`);
         } else {
+          const taskNow = store.getTask(cwd, worker.assignedTaskId);
+          const baseRef = taskNow?.base_commit ? ` Prior attempt base commit: ${taskNow.base_commit}.` : "";
           store.updateTask(cwd, worker.assignedTaskId, { status: "todo", assigned_to: undefined });
           store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
-            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing. Reset to todo.`);
+            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing.${baseRef} Reset to todo.`);
           logFeedEvent(cwd, worker.name, "task.reset", worker.assignedTaskId, "worker exited");
         }
       }
     } else {
       logFeedEvent(cwd, worker.name, "leave", undefined, `Lobby worker exited (code ${exitCode ?? "unknown"})`);
     }
-    // Crew-empty detection: if the last live worker (lobby OR regular
-    // spawnAgents) just exited while the plan still has outstanding work,
-    // surface it in the feed. Node serializes close handlers, but a
-    // concurrently-dying worker's exitCode can already be set before its own
-    // close handler unregisters it — dedupe to avoid duplicate events.
+    // Crew-empty detection: fires from the lobby close handler only — regular
+    // spawnAgents workers are awaited synchronously by work.execute(), so a
+    // lobby worker exiting autonomously is the one case where the orchestrator
+    // is NOT already in control and an idle advisory is meaningful.
+    // Node serializes close handlers, but a concurrently-dying worker's
+    // exitCode can already be set before its own close handler unregisters
+    // it — dedupe (per cwd) to avoid duplicate events.
     try {
       if (isAutonomousForCwd(cwd)) {
         const now = Date.now();

@@ -151,14 +151,45 @@ describe("crew/indeterminate receipts and crew idle", () => {
     expect(response.details.failed ?? []).toEqual([]);
   });
 
+  it("non-autonomous crash on a never-started todo task consumes an attempt", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+
+    // Non-graceful crash while the task is still todo (worker exited before
+    // task.start): must consume an attempt so a crash loop hits
+    // maxAttemptsPerTask instead of being bounded only by maxWaves.
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async () =>
+      [makeResult(task.id, 1, { error: "crashed before start" })]
+    );
+
+    const response = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+
+    const reloaded = store.getTask(dirs.cwd, task.id);
+    expect(reloaded?.status).toBe("todo");
+    expect(reloaded?.attempt_count).toBe(1);
+    expect(response.details.failed ?? []).toEqual([task.id]);
+    expect(response.details.indeterminate ?? []).toEqual([]);
+  });
+
   it("getLiveWorkers sees regular spawnAgents workers, not just lobby workers", async () => {
     const registry = await import("../../crew/registry.ts");
 
     const cwdA = dirs.cwd;
     const cwdB = `${dirs.cwd}-other`;
 
-    const fakeProc = () => ({ exitCode: null, killed: false, kill: () => {} }) as never;
-    const deadProc = () => ({ exitCode: 1, killed: false, kill: () => {} }) as never;
+    const fakeProc = () => ({ exitCode: null, kill: () => {} }) as never;
+    const deadProc = () => ({ exitCode: 1, kill: () => {} }) as never;
+    const killedProc = () => ({ exitCode: null, killed: true, kill: () => {} }) as never;
 
     registry.registerWorker({
       type: "worker",
@@ -192,6 +223,16 @@ describe("crew/indeterminate receipts and crew idle", () => {
     expect(live).toHaveLength(1);
     expect(live[0].name).toBe("RegularOne");
     expect(registry.getLobbyWorkers(cwdA)).toHaveLength(1); // dead lobby still listed by type
+
+    // A killed-but-not-yet-exited process counts as live (signal sent ≠ dead).
+    registry.registerWorker({
+      type: "worker",
+      proc: killedProc(),
+      name: "KilledButAlive",
+      cwd: cwdA,
+      taskId: "task-a2",
+    } as never);
+    expect(registry.getLiveWorkers(cwdA)).toHaveLength(2);
 
     registry.killAll();
   });

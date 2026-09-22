@@ -41,7 +41,7 @@ const __dirname = path.dirname(__filename);
 const EXTENSION_DIR = path.resolve(__dirname, "..");
 
 const IDLE_EVENT_DEDUPE_MS = 2000;
-let lastIdleEventAt = 0;
+const lastIdleEventAt = new Map<string, number>();
 
 export const LOBBY_TOKEN_BUDGETS: Record<string, number> = {
   none: 10_000,
@@ -211,11 +211,17 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
     try {
       if (isAutonomousForCwd(cwd)) {
         const now = Date.now();
-        if (now - lastIdleEventAt < IDLE_EVENT_DEDUPE_MS) return;
+        // Dedupe per cwd: concurrent close handlers (or another autonomous
+        // project's workers) must not suppress each other's events.
+        if (now - (lastIdleEventAt.get(cwd) ?? 0) < IDLE_EVENT_DEDUPE_MS) return;
+        // getLiveWorkers treats any process that has not exited as live.
+        // Deliberately no !proc.killed check: `killed` means a signal was sent,
+        // not that the process died — excluding such workers could fire idle
+        // while a shutdown-in-flight worker is still running.
         const liveOthers = getLiveWorkers(cwd).filter(w => w !== worker);
         const outstanding = store.getTasks(cwd).filter(t => t.status === "todo" || t.status === "in_progress");
         if (liveOthers.length === 0 && outstanding.length > 0) {
-          lastIdleEventAt = now;
+          lastIdleEventAt.set(cwd, now);
           logFeedEvent(cwd, "crew", "crew.idle", undefined,
             `All crew workers exited with outstanding work: ${outstanding.map(t => t.id).join(", ")}. Autonomous continuation should resume them; if the session stopped, run pi_messenger({ action: "work", autonomous: true }).`);
         }

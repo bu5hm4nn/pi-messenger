@@ -117,12 +117,16 @@ export function getLobbyWorkerCount(cwd: string): number {
  * All live workers for a cwd, both regular (spawnAgents) and lobby types.
  * Use for crew-wide liveness checks — the lobby-only getters miss
  * type:'worker' entries spawned by spawnAgents.
+ *
+ * Liveness predicate: exitCode === null only. Deliberately excludes no
+ * `proc.killed` check — a killed process whose signal has been sent but not
+ * yet acted on is still running and must count as live for idle detection.
  */
 export function getLiveWorkers(cwd: string): WorkerEntry[] {
   const result: WorkerEntry[] = [];
   for (const entry of workers.values()) {
     if (entry.cwd !== cwd) continue;
-    if (entry.proc.exitCode === null && !entry.proc.killed) result.push(entry);
+    if (entry.proc.exitCode === null) result.push(entry);
   }
   return result;
 }

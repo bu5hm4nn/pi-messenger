@@ -165,7 +165,8 @@ describe("crew/graceful shutdown", () => {
     const reloaded = store.getTask(dirs.cwd, task.id);
     expect(reloaded?.status).toBe("todo");
     expect(reloaded?.assigned_to).toBeUndefined();
-    expect(response.details.failed).toEqual([task.id]);
+    expect(response.details.indeterminate).toEqual([task.id]);
+    expect(response.details.failed).toEqual([]);
     expect(response.details.blocked).toEqual([]);
   });
 
@@ -467,10 +468,10 @@ describe("crew/graceful shutdown", () => {
     const reloaded = store.getTask(dirs.cwd, t1.id);
     expect(reloaded?.status).toBe("todo");
     expect(reloaded?.assigned_to).toBeUndefined();
-    expect(response.details.failed).toEqual([t1.id]);
+    expect(response.details.indeterminate).toEqual([t1.id]);
   });
 
-  it("graceful shutdown with non-zero exit and in_progress task resets to todo and reports failed", async () => {
+  it("graceful shutdown with non-zero exit and in_progress task resets to todo and reports indeterminate", async () => {
     const store = await import("../../crew/store.ts");
     const agents = await import("../../crew/agents.ts");
     const workHandler = await import("../../crew/handlers/work.ts");
@@ -512,7 +513,7 @@ describe("crew/graceful shutdown", () => {
     const reloaded = store.getTask(dirs.cwd, t1.id);
     expect(reloaded?.status).toBe("todo");
     expect(reloaded?.assigned_to).toBeUndefined();
-    expect(response.details.failed).toEqual([t1.id]);
+    expect(response.details.indeterminate).toEqual([t1.id]);
     expect(response.details.blocked).toEqual([]);
   });
 });

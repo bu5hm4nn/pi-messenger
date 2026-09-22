@@ -184,7 +184,7 @@ export async function execute(
     );
     const others = readyTasks.filter(t => t.id !== task.id);
     const prompt = buildWorkerPrompt(task, prdLabel, cwd, config, others, skills, teamStore.buildTeamPromptContext(cwd, task));
-    store.appendTaskProgress(cwd, task.id, "system", `Assigned to crew-worker (attempt ${task.attempt_count + 1})`);
+    store.appendTaskProgress(cwd, task.id, "system", `Assigned to crew-worker`);
 
     return {
       agent: "crew-worker",
@@ -206,7 +206,65 @@ export async function execute(
   // Process results
   const succeeded: string[] = [];
   const failed: string[] = [];
+  const indeterminate: string[] = [];
   const blocked: string[] = [];
+
+  // A worker that exited without clean task.done bookkeeping: its work may
+  // have landed on disk. Mark indeterminate instead of failed.
+  const markIndeterminate = (taskId: string, taskStatus: string | undefined, why: string) => {
+    store.appendTaskProgress(cwd, taskId, "system",
+      `Worker exited before task.done (status was ${taskStatus ?? "unknown"}) — indeterminate: work may have landed. Re-attempt must FIRST reconcile: run git log/diff against the task base commit and review/reuse any landed work before re-implementing. ${why}`);
+    indeterminate.push(taskId);
+  };
+
+  // A worker that exited before task.start: the task was never claimed, so
+  // nothing was expected to land — but a protocol-violating worker can still
+  // have edited files, so label it indeterminate with a distinct message.
+  const markNeverStarted = (taskId: string, why: string) => {
+    store.appendTaskProgress(cwd, taskId, "system",
+      `Worker exited before task.start — task never claimed. Verify disk only if unexpected. ${why}`);
+    indeterminate.push(taskId);
+  };
+
+  type ResetOutcome = "blocked" | "todo" | "missing";
+
+  // Reset a task whose in_progress worker exited. The attempt for an
+  // in_progress task was already consumed by the worker's task.start.
+  const resetInterruptedTask = (taskId: string, task: { attempt_count?: number } | undefined, why: string): ResetOutcome => {
+    if (!task) return "missing";
+    if ((task.attempt_count ?? 0) >= config.work.maxAttemptsPerTask) {
+      store.updateTask(cwd, taskId, {
+        status: "blocked",
+        blocked_reason: `Max attempts (${config.work.maxAttemptsPerTask}) reached`,
+        assigned_to: undefined,
+      });
+      logFeedEvent(cwd, "crew", "task.block", taskId, "Max attempts reached after worker exit");
+      return "blocked";
+    }
+    store.updateTask(cwd, taskId, { status: "todo", assigned_to: undefined });
+    return "todo";
+  };
+
+  // Reset a task the worker exited BEFORE claiming (task.start never ran):
+  // attempt_count was never persisted on the spawnAgents dispatch path, so
+  // consume an attempt here or the maxAttemptsPerTask backstop is bypassed
+  // and autonomous retries are bounded only by maxWaves.
+  const resetNeverStartedTask = (taskId: string, task: { attempt_count?: number } | undefined, why: string): ResetOutcome => {
+    if (!task) return "missing";
+    const nextAttempt = (task.attempt_count ?? 0) + 1;
+    if (nextAttempt > config.work.maxAttemptsPerTask) {
+      store.updateTask(cwd, taskId, {
+        status: "blocked",
+        blocked_reason: `Max attempts (${config.work.maxAttemptsPerTask}) reached`,
+        assigned_to: undefined,
+        attempt_count: nextAttempt,
+      });
+      logFeedEvent(cwd, "crew", "task.block", taskId, "Max attempts reached after worker exit");
+      return "blocked";
+    }
+    store.updateTask(cwd, taskId, { status: "todo", assigned_to: undefined, attempt_count: nextAttempt });
+    return "todo";
+  };
 
   for (let i = 0; i < workerResults.length; i++) {
     const r = workerResults[i];
@@ -223,10 +281,20 @@ export async function execute(
       } else if (task?.status === "blocked") {
         blocked.push(taskId);
       } else if (task?.status === "in_progress") {
-        store.appendTaskProgress(cwd, taskId, "system",
-          r.wasGracefullyShutdown ? "Task interrupted (shutdown), reset to todo" : "Worker exited without completing task, reset to todo");
-        store.updateTask(cwd, taskId, { status: "todo", assigned_to: undefined });
-        failed.push(taskId);
+        const outcome = resetInterruptedTask(taskId, task, r.wasGracefullyShutdown ? "Graceful shutdown." : "");
+        if (outcome === "blocked") {
+          blocked.push(taskId);
+        } else {
+          markIndeterminate(taskId, task.status,
+            r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
+        }
+      } else if (task?.status === "todo") {
+        const outcome = resetNeverStartedTask(taskId, task, r.wasGracefullyShutdown ? "Graceful shutdown." : "");
+        if (outcome === "blocked") {
+          blocked.push(taskId);
+        } else {
+          markNeverStarted(taskId, r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
+        }
       } else {
         failed.push(taskId);
       }
@@ -237,9 +305,19 @@ export async function execute(
         } else if (task?.status === "blocked") {
           blocked.push(taskId);
         } else if (task?.status === "in_progress") {
-          store.appendTaskProgress(cwd, taskId, "system", "Task interrupted (shutdown), reset to todo");
-          store.updateTask(cwd, taskId, { status: "todo", assigned_to: undefined });
-          failed.push(taskId);
+          const outcome = resetInterruptedTask(taskId, task, "Graceful shutdown.");
+          if (outcome === "blocked") {
+            blocked.push(taskId);
+          } else {
+            markIndeterminate(taskId, task.status, "Graceful shutdown.");
+          }
+        } else if (task?.status === "todo") {
+          const outcome = resetNeverStartedTask(taskId, task, "Graceful shutdown.");
+          if (outcome === "blocked") {
+            blocked.push(taskId);
+          } else {
+            markNeverStarted(taskId, "Graceful shutdown.");
+          }
         } else {
           failed.push(taskId);
         }
@@ -250,6 +328,13 @@ export async function execute(
       } else {
         if (task?.status === "in_progress") {
           store.appendTaskProgress(cwd, taskId, "system", `Worker failed: ${r.error ?? "Unknown error"}`);
+          // Non-autonomous: previously left stuck in_progress forever; reset so
+          // the next wave can retry (or block at max attempts).
+          const outcome = resetInterruptedTask(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
+          if (outcome === "blocked") {
+            blocked.push(taskId);
+            continue;
+          }
         }
         failed.push(taskId);
       }
@@ -320,6 +405,7 @@ export async function execute(
       tasksAttempted: remainingTasks.map(t => t.id),
       succeeded,
       failed,
+      indeterminate,
       blocked,
       timestamp: new Date().toISOString()
     });
@@ -374,6 +460,7 @@ export async function execute(
 
   let statusText = "";
   if (succeeded.length > 0) statusText += `\n✅ Completed: ${succeeded.join(", ")}`;
+  if (indeterminate.length > 0) statusText += `\n⚠️ Indeterminate: ${indeterminate.join(", ")} — worker exited before task.done; verify commits/tests on disk`;
   if (failed.length > 0) statusText += `\n❌ Failed: ${failed.join(", ")}`;
   if (blocked.length > 0) statusText += `\n🚫 Blocked: ${blocked.join(", ")}`;
   if (finalNeedsApproval.length > 0) statusText += `\n🛑 Needs approval: ${finalNeedsApproval.map(t => t.id).join(", ")}`;
@@ -407,6 +494,7 @@ ${continueText}`;
     attempted: remainingTasks.map(t => t.id),
     succeeded,
     failed,
+    indeterminate,
     blocked,
     needsApproval: approvalTaskSummaries(finalNeedsApproval),
     rejected: approvalTaskSummaries(finalRejected),

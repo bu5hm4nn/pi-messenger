@@ -324,7 +324,7 @@ describe("lobby workers", () => {
     });
     expect(storeModule.appendTaskProgress).toHaveBeenCalledWith(
       "/test/cwd", "task-1", "system",
-      expect.stringContaining("reset to todo"),
+      expect.stringContaining("indeterminate"),
     );
     expect(feedModule.logFeedEvent).toHaveBeenCalledWith(
       "/test/cwd", worker.name, "task.reset", "task-1", "worker exited",

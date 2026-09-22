@@ -11,6 +11,7 @@ export interface WaveResult {
   tasksAttempted: string[];
   succeeded: string[];
   failed: string[];
+  indeterminate?: string[];
   blocked: string[];
   timestamp: string;
 }

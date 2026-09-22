@@ -112,3 +112,17 @@ export function getLobbyWorkerCount(cwd: string): number {
   }
   return count;
 }
+
+/**
+ * All live workers for a cwd, both regular (spawnAgents) and lobby types.
+ * Use for crew-wide liveness checks — the lobby-only getters miss
+ * type:'worker' entries spawned by spawnAgents.
+ */
+export function getLiveWorkers(cwd: string): WorkerEntry[] {
+  const result: WorkerEntry[] = [];
+  for (const entry of workers.values()) {
+    if (entry.cwd !== cwd) continue;
+    if (entry.proc.exitCode === null && !entry.proc.killed) result.push(entry);
+  }
+  return result;
+}

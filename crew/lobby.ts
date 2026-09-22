@@ -23,6 +23,8 @@ import {
 } from "./utils/progress.ts";
 import { updateLiveWorker, removeLiveWorker } from "./live-progress.ts";
 import * as store from "./store.ts";
+import { isAutonomousForCwd } from "./state.ts";
+import { getLiveWorkers } from "./registry.ts";
 import { logFeedEvent } from "../feed.ts";
 import {
   registerWorker,
@@ -37,6 +39,9 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const EXTENSION_DIR = path.resolve(__dirname, "..");
+
+const IDLE_EVENT_DEDUPE_MS = 2000;
+let lastIdleEventAt = 0;
 
 export const LOBBY_TOKEN_BUDGETS: Record<string, number> = {
   none: 10_000,
@@ -191,12 +196,32 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
         } else {
           store.updateTask(cwd, worker.assignedTaskId, { status: "todo", assigned_to: undefined });
           store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
-            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}), reset to todo`);
+            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing. Reset to todo.`);
           logFeedEvent(cwd, worker.name, "task.reset", worker.assignedTaskId, "worker exited");
         }
       }
     } else {
       logFeedEvent(cwd, worker.name, "leave", undefined, `Lobby worker exited (code ${exitCode ?? "unknown"})`);
+    }
+    // Crew-empty detection: if the last live worker (lobby OR regular
+    // spawnAgents) just exited while the plan still has outstanding work,
+    // surface it in the feed. Node serializes close handlers, but a
+    // concurrently-dying worker's exitCode can already be set before its own
+    // close handler unregisters it — dedupe to avoid duplicate events.
+    try {
+      if (isAutonomousForCwd(cwd)) {
+        const now = Date.now();
+        if (now - lastIdleEventAt < IDLE_EVENT_DEDUPE_MS) return;
+        const liveOthers = getLiveWorkers(cwd).filter(w => w !== worker);
+        const outstanding = store.getTasks(cwd).filter(t => t.status === "todo" || t.status === "in_progress");
+        if (liveOthers.length === 0 && outstanding.length > 0) {
+          lastIdleEventAt = now;
+          logFeedEvent(cwd, "crew", "crew.idle", undefined,
+            `All crew workers exited with outstanding work: ${outstanding.map(t => t.id).join(", ")}. Autonomous continuation should resume them; if the session stopped, run pi_messenger({ action: "work", autonomous: true }).`);
+        }
+      }
+    } catch (e) {
+      console.error(`[pi-messenger] crew.idle detection failed: ${e instanceof Error ? e.message : e}`);
     }
   });
 

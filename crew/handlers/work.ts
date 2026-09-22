@@ -212,8 +212,12 @@ export async function execute(
   // A worker that exited without clean task.done bookkeeping: its work may
   // have landed on disk. Mark indeterminate instead of failed.
   const markIndeterminate = (taskId: string, taskStatus: string | undefined, why: string) => {
+    const task = store.getTask(cwd, taskId);
+    // Embed the pre-exit base commit: task.start overwrites base_commit on the
+    // re-attempt, so the reconcile instruction would otherwise lose its anchor.
+    const baseRef = task?.base_commit ? ` Prior attempt base commit: ${task.base_commit}.` : "";
     store.appendTaskProgress(cwd, taskId, "system",
-      `Worker exited before task.done (status was ${taskStatus ?? "unknown"}) — indeterminate: work may have landed. Re-attempt must FIRST reconcile: run git log/diff against the task base commit and review/reuse any landed work before re-implementing. ${why}`);
+      `Worker exited before task.done (status was ${taskStatus ?? "unknown"}) — indeterminate: work may have landed. Re-attempt must FIRST reconcile: run git log/diff against the task base commit and review/reuse any landed work before re-implementing.${baseRef} ${why}`);
     indeterminate.push(taskId);
   };
 
@@ -331,6 +335,15 @@ export async function execute(
           // Non-autonomous: previously left stuck in_progress forever; reset so
           // the next wave can retry (or block at max attempts).
           const outcome = resetInterruptedTask(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
+          if (outcome === "blocked") {
+            blocked.push(taskId);
+            continue;
+          }
+        } else if (task?.status === "todo") {
+          // Worker crashed before claiming the task. Consume an attempt here
+          // too — otherwise a crash-looping worker is bounded only by maxWaves,
+          // never by maxAttemptsPerTask.
+          const outcome = resetNeverStartedTask(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
           if (outcome === "blocked") {
             blocked.push(taskId);
             continue;

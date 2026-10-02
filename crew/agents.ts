@@ -209,7 +209,10 @@ async function runAgent(
 
   return new Promise((resolve) => {
     // Build args for pi command
-    const args = ["--mode", "json", "--no-session", "-p"];
+    // `-ne` (--no-extensions) disables extension DISCOVERY for the worker session;
+    // only the explicit `--extension` paths below load, so orchestrator-only
+    // extensions (intercom, scrumble) never enter a crew worker.
+    const args = ["--mode", "json", "--no-session", "-ne", "-p"];
     const model = task.modelOverride ?? config.models?.[role] ?? agentConfig?.model;
     if (model) pushModelArgs(args, model);
 

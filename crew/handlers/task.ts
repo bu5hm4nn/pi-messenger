@@ -264,6 +264,7 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
     assigned_to: undefined,
     summary: undefined,
     evidence: undefined,
+    completed_by: undefined,
     blocked_reason: undefined,
     role: undefined,
     risk_labels: undefined,
@@ -502,7 +503,7 @@ function taskDone(cwd: string, params: CrewParams, state: MessengerState) {
   const summary = params.summary ?? "Task completed";
   const evidence: TaskEvidence | undefined = params.evidence;
 
-  const completed = store.completeTask(cwd, id, summary, evidence);
+  const completed = store.completeTask(cwd, id, summary, evidence, state.agentName || "unknown");
   if (!completed) {
     return result(`Error: Failed to complete task ${id}`, { mode: "task.done", error: "complete_failed", id });
   }

@@ -64,6 +64,27 @@ describe("Crew idle overlay flash", () => {
     expect(viewState.notification?.message).toContain("2 crew idle events");
   });
 
+  it("does not discard an unseen crew.idle when a later significant event is in the same batch", () => {
+    const viewState = flashEvents([
+      { ts: "2026-01-01T00:00:01.000Z", agent: "crew", type: "crew.idle", preview: "outstanding work" },
+      { ts: "2026-01-01T00:00:02.000Z", agent: "WorkerOne", type: "task.done", target: "task-1", preview: "done" },
+    ], "2026-01-01T00:00:00.000Z");
+
+    expect(viewState.notification?.message).toContain("crew idle");
+  });
+
+  it("flashes two distinct idle transitions observed in separate batches", () => {
+    const first = flashEvents([
+      { ts: "2026-01-01T00:00:01.000Z", agent: "crew", type: "crew.idle", preview: "first transition" },
+    ], "2026-01-01T00:00:00.000Z");
+    const second = flashEvents([
+      { ts: "2026-01-01T00:00:02.000Z", agent: "crew", type: "crew.idle", preview: "second transition" },
+    ], "2026-01-01T00:00:01.000Z");
+
+    expect(first.notification?.message).toContain("crew idle");
+    expect(second.notification?.message).toContain("crew idle");
+  });
+
   it("does not flash an already-seen crew.idle event", () => {
     const viewState = flashEvents([
       { ts: "2026-01-01T00:00:00.000Z", agent: "crew", type: "crew.idle", preview: "seen" },

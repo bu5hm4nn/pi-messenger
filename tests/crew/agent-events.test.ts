@@ -111,6 +111,44 @@ describe("crew agent event handling", () => {
     expect(result.workerName).toBe("WaveAWorker");
   });
 
+  it("injects and records the dispatch identity when crewRole is renamed", async () => {
+    const store = await import("../../crew/store.ts");
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+
+    // A project override can rename the role; the explicit dispatch identity
+    // must still reach the worker and be recorded on the task.
+    fs.writeFileSync(path.join(dirs.cwd, ".pi", "messenger", "crew", "agents", "crew-worker.md"),
+      `---
+name: crew-worker
+description: Renamed worker
+crewRole: implementer
+---
+You are an implementer.
+`);
+
+    const proc = createProcess();
+    spawnMock.mockReturnValue(proc);
+    const { spawnAgents } = await import("../../crew/agents.ts");
+
+    const resultPromise = spawnAgents([{
+      agent: "crew-worker",
+      task: "Implement task",
+      taskId: task.id,
+      workerName: "RenamedWorker-7f3a",
+    }], dirs.cwd);
+
+    proc.exitCode = 0;
+    proc.emit("close", 0);
+
+    const [result] = await resultPromise;
+
+    expect(spawnMock.mock.calls[0][2].env.PI_AGENT_NAME).toBe("RenamedWorker-7f3a");
+    expect(spawnMock.mock.calls[0][2].env.PI_CREW_WORKER).toBeUndefined();
+    expect(result.workerName).toBe("RenamedWorker-7f3a");
+    expect(store.getTask(dirs.cwd, task.id)?.assigned_to).toBe("RenamedWorker-7f3a");
+  });
+
   it("fails fast on terminal provider quota errors", async () => {
     const proc = createProcess();
     spawnMock.mockReturnValue(proc);

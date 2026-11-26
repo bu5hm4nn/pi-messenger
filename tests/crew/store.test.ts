@@ -310,6 +310,50 @@ describe("crew/store", () => {
       expect(fs.existsSync(blockFile)).toBe(false);
     });
 
+    it("guarded reset does not clobber a task.start claim that lands after the orchestrator snapshot", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "Desc one");
+
+      // Orchestrator dispatch claim: todo + assigned to wave A.
+      const claimedA = store.claimTaskForDispatch(cwd, task.id, "WaveA-aaaa");
+      expect(claimedA?.status).toBe("todo");
+      expect(claimedA?.assigned_to).toBe("WaveA-aaaa");
+      const snapshot = store.getTask(cwd, task.id)!;
+
+      // Worker B (a separate pi process) starts the task between the
+      // orchestrator's snapshot read and its reset write.
+      const started = store.startTask(cwd, task.id, "WaveB-bbbb");
+      expect(started?.status).toBe("in_progress");
+      expect(started?.assigned_to).toBe("WaveB-bbbb");
+
+      // The guarded reset re-reads under the per-task lock and must abort.
+      const reset = store.mutateTask(cwd, task.id, current =>
+        current.status === "todo" && current.assigned_to === snapshot.assigned_to
+          ? { status: "todo", assigned_to: undefined }
+          : null
+      );
+      expect(reset).toBeNull();
+
+      const after = store.getTask(cwd, task.id)!;
+      expect(after.status).toBe("in_progress");
+      expect(after.assigned_to).toBe("WaveB-bbbb");
+      expect(after.attempt_count).toBe(1);
+      expect(after.started_at).toBeDefined();
+    });
+
+    it("claimTaskForDispatch refuses to overwrite a concurrent claim", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "Desc one");
+      store.startTask(cwd, task.id, "WaveB-bbbb");
+
+      const lateClaim = store.claimTaskForDispatch(cwd, task.id, "WaveA-aaaa");
+      expect(lateClaim).toBeNull();
+
+      const after = store.getTask(cwd, task.id)!;
+      expect(after.status).toBe("in_progress");
+      expect(after.assigned_to).toBe("WaveB-bbbb");
+    });
+
     it("resetTask(cascade: true) resets dependents recursively and syncs completed_count", () => {
       store.createPlan(cwd, "docs/PRD.md");
       const t1 = store.createTask(cwd, "Task one", "Desc one");

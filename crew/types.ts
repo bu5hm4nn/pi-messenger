@@ -66,6 +66,7 @@ export interface Task {
   assigned_to?: string;          // Agent name currently working on it
   summary?: string;              // Completion summary from task.done
   evidence?: TaskEvidence;       // Evidence from task.done
+  completed_by?: string;         // Worker identity that called task.done
   blocked_reason?: string;       // Reason from task.block
   attempt_count: number;         // How many times attempted (for auto-block)
   review_count?: number;         // How many times reviewed
@@ -181,6 +182,8 @@ export interface AgentResult {
   taskId?: string;
   /** Runtime worker identity (PI_AGENT_NAME) used to fence stale receipts. */
   workerName?: string;
+  /** Dispatch was abandoned because the task was no longer claimable. */
+  skipped?: boolean;
   wasGracefullyShutdown?: boolean;
   error?: string;
   artifactPaths?: {

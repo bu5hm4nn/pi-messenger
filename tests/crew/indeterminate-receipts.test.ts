@@ -5,6 +5,13 @@ import type { MessengerState } from "../../lib.ts";
 import { createTempCrewDirs, type TempCrewDirs } from "../helpers/temp-dirs.ts";
 import { createMockContext } from "../helpers/mock-context.ts";
 
+// Both dispatch draws return the same display name; the unique suffix added at
+// dispatch is what fences the stale receipt.
+vi.mock("../../lib.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib.ts")>();
+  return { ...actual, generateMemorableName: () => "SwiftArrow" };
+});
+
 function writeWorkerAgent(cwd: string): void {
   const filePath = path.join(cwd, ".pi", "messenger", "crew", "agents", "crew-worker.md");
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -64,6 +71,11 @@ describe("crew/indeterminate receipts and crew idle", () => {
     expect(task.attempt_count).toBe(0);
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      // Ownership is recorded at the launch point (runAgent), which this mock
+      // replaces; mirror that before the receipt is classified.
+      for (const t of tasks) {
+        if (t.taskId) store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
+      }
       // Task stays todo — the worker exited before calling task.start.
       return [makeResult(task.id, 0, { workerName: tasks[0]?.workerName })];
     });
@@ -99,7 +111,10 @@ describe("crew/indeterminate receipts and crew idle", () => {
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
-        if (t.taskId) store.startTask(dirs.cwd, t.taskId, t.workerName!);
+        if (t.taskId) {
+          store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
+          store.startTask(dirs.cwd, t.taskId, t.workerName!);
+        }
       }
       return tasks.map(t => makeResult(t.taskId!, 0, { workerName: t.workerName }));
     });
@@ -133,7 +148,10 @@ describe("crew/indeterminate receipts and crew idle", () => {
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
-        if (t.taskId) store.startTask(dirs.cwd, t.taskId, t.workerName!);
+        if (t.taskId) {
+          store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
+          store.startTask(dirs.cwd, t.taskId, t.workerName!);
+        }
       }
       return tasks.map(t => makeResult(t.taskId!, 1, { error: "crashed", workerName: t.workerName }));
     });
@@ -164,9 +182,12 @@ describe("crew/indeterminate receipts and crew idle", () => {
     // Non-graceful crash while the task is still todo (worker exited before
     // task.start): must consume an attempt so a crash loop hits
     // maxAttemptsPerTask instead of being bounded only by maxWaves.
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) =>
-      [makeResult(task.id, 1, { error: "crashed before start", workerName: tasks[0]?.workerName })]
-    );
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      for (const t of tasks) {
+        if (t.taskId) store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
+      }
+      return [makeResult(task.id, 1, { error: "crashed before start", workerName: tasks[0]?.workerName })];
+    });
 
     const response = await workHandler.execute(
       { action: "work" },
@@ -196,9 +217,12 @@ describe("crew/indeterminate receipts and crew idle", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
 
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) =>
-      [makeResult(task.id, 0, { workerName: tasks[0]?.workerName })]
-    );
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      for (const t of tasks) {
+        if (t.taskId) store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
+      }
+      return [makeResult(task.id, 0, { workerName: tasks[0]?.workerName })];
+    });
 
     // Wave 1: never-started exit consumes the single attempt (nextAttempt 1,
     // 1 > 1 is false, so the task stays todo — the NEXT wave blocks).
@@ -239,17 +263,14 @@ describe("crew/indeterminate receipts and crew idle", () => {
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       waveAWorker = tasks[0]?.workerName;
       expect(waveAWorker).toBeTruthy();
-      // The dispatch side recorded the same identity the receipt will carry.
+      // Ownership is recorded at launch, not while the queue is built.
+      expect(store.getTask(dirs.cwd, task.id)?.assigned_to).toBeUndefined();
+      store.claimTaskForDispatch(dirs.cwd, task.id, waveAWorker!);
       expect(store.getTask(dirs.cwd, task.id)?.assigned_to).toBe(waveAWorker);
 
       // Wave A claims the task via task.start, then exits without task.done.
-      store.updateTask(dirs.cwd, task.id, {
-        status: "in_progress",
-        assigned_to: waveAWorker,
-        attempt_count: 1,
-        base_commit: "aaa1111",
-        started_at: new Date().toISOString(),
-      });
+      store.startTask(dirs.cwd, task.id, waveAWorker!);
+      store.updateTask(dirs.cwd, task.id, { base_commit: "aaa1111" });
 
       // Before A's receipt is classified, wave B re-claims and starts the task.
       store.updateTask(dirs.cwd, task.id, { status: "todo", assigned_to: undefined });
@@ -457,5 +478,255 @@ describe("crew/indeterminate receipts and crew idle", () => {
     expect(registry.getLiveWorkers(cwdA)).toHaveLength(2);
 
     registry.killAll();
+  });
+
+  it("same display name with a different dispatch suffix is fenced as stale", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+
+    let waveAWorker: string | undefined;
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      waveAWorker = tasks[0]?.workerName;
+      expect(waveAWorker).toMatch(/^SwiftArrow-[0-9a-f]{4}$/);
+
+      // Wave A launches and claims the task.
+      store.claimTaskForDispatch(dirs.cwd, task.id, waveAWorker!);
+      store.startTask(dirs.cwd, task.id, waveAWorker!);
+
+      // Wave B re-draws the same memorable name but has its own suffix.
+      const waveBWorker = "SwiftArrow-bbbb";
+      expect(waveBWorker.startsWith("SwiftArrow")).toBe(true);
+      store.updateTask(dirs.cwd, task.id, { status: "todo", assigned_to: undefined });
+      store.claimTaskForDispatch(dirs.cwd, task.id, waveBWorker);
+      store.startTask(dirs.cwd, task.id, waveBWorker);
+      store.updateTask(dirs.cwd, task.id, { base_commit: "bbb2222" });
+
+      // A's receipt arrives late. Equal display names must not let it pass.
+      return [makeResult(task.id, 1, { error: "wave A crashed", workerName: waveAWorker })];
+    });
+
+    const response = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+
+    const untouched = store.getTask(dirs.cwd, task.id)!;
+    expect(untouched.status).toBe("in_progress");
+    expect(untouched.assigned_to).toBe("SwiftArrow-bbbb");
+    expect(untouched.attempt_count).toBe(2);
+    expect(untouched.base_commit).toBe("bbb2222");
+
+    const progress = store.getTaskProgress(dirs.cwd, task.id) ?? "";
+    expect(progress).toContain(`Ignored stale result from ${waveAWorker}`);
+    expect(progress).toContain("SwiftArrow-bbbb");
+
+    expect(response.details.failed ?? []).toEqual([]);
+    expect(response.details.blocked ?? []).toEqual([]);
+    expect(response.details.indeterminate ?? []).toEqual([]);
+  });
+
+  it("receipt with no worker identity on a mutable task is unattributable: no mutation, ignore note", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+
+    let owner: string | undefined;
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      owner = tasks[0]?.workerName!;
+      store.claimTaskForDispatch(dirs.cwd, task.id, owner);
+      store.startTask(dirs.cwd, task.id, owner);
+      // Legacy/foreign receipt: no workerName, so it cannot be attributed.
+      return [makeResult(task.id, 0)];
+    });
+
+    const response = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+
+    const reloaded = store.getTask(dirs.cwd, task.id)!;
+    expect(reloaded.status).toBe("in_progress");
+    expect(reloaded.assigned_to).toBe(owner);
+    expect(reloaded.attempt_count).toBe(1);
+
+    const progress = store.getTaskProgress(dirs.cwd, task.id) ?? "";
+    expect(progress).toContain("Ignored unattributable result from crew-worker");
+    expect(progress).not.toContain("Worker exited before task.done");
+
+    expect(response.details.indeterminate ?? []).toEqual([]);
+    expect(response.details.failed ?? []).toEqual([]);
+    expect(response.details.blocked ?? []).toEqual([]);
+  });
+
+  it("final allowed exit-0 in_progress attempt records the reconciliation note with its base commit", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+    fs.writeFileSync(
+      path.join(dirs.crewDir, "config.json"),
+      JSON.stringify({ work: { maxAttemptsPerTask: 1 } }),
+    );
+
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
+      store.startTask(dirs.cwd, task.id, workerName);
+      store.updateTask(dirs.cwd, task.id, { base_commit: "feedface" });
+      return [makeResult(task.id, 0, { workerName })];
+    });
+
+    const response = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+
+    const reloaded = store.getTask(dirs.cwd, task.id)!;
+    expect(reloaded.status).toBe("blocked");
+    expect(reloaded.attempt_count).toBe(1);
+
+    const progress = store.getTaskProgress(dirs.cwd, task.id) ?? "";
+    expect(progress).toContain("indeterminate: work may have landed");
+    expect(progress).toContain("Prior attempt base commit: feedface.");
+
+    expect(response.details.blocked ?? []).toEqual([task.id]);
+    expect(response.details.indeterminate ?? []).toEqual([]);
+  });
+
+  it("final allowed non-zero crash attempt records the reconciliation note before blocking", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+    fs.writeFileSync(
+      path.join(dirs.crewDir, "config.json"),
+      JSON.stringify({ work: { maxAttemptsPerTask: 1 } }),
+    );
+
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
+      store.startTask(dirs.cwd, task.id, workerName);
+      store.updateTask(dirs.cwd, task.id, { base_commit: "feedface" });
+      return [makeResult(task.id, 1, { error: "boom", workerName })];
+    });
+
+    const response = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+
+    const reloaded = store.getTask(dirs.cwd, task.id)!;
+    expect(reloaded.status).toBe("blocked");
+    expect(reloaded.attempt_count).toBe(1);
+
+    const progress = store.getTaskProgress(dirs.cwd, task.id) ?? "";
+    expect(progress).toContain("Worker failed: boom");
+    expect(progress).toContain("indeterminate: work may have landed");
+    expect(progress).toContain("Prior attempt base commit: feedface.");
+
+    expect(response.details.blocked ?? []).toEqual([task.id]);
+    expect(response.details.indeterminate ?? []).toEqual([]);
+  });
+
+  it("never-started crash records the distinct never-started wording and prior base commit", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+    store.updateTask(dirs.cwd, task.id, { base_commit: "cafebabe" });
+
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
+      // No task.start: the worker crashed before claiming.
+      return [makeResult(task.id, 1, { error: "crashed", workerName })];
+    });
+
+    const response = await workHandler.execute(
+      { action: "work" },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+
+    const reloaded = store.getTask(dirs.cwd, task.id)!;
+    expect(reloaded.status).toBe("todo");
+    expect(reloaded.attempt_count).toBe(1);
+
+    const progress = store.getTaskProgress(dirs.cwd, task.id) ?? "";
+    expect(progress).toContain("work may not have started — verify state before retrying.");
+    expect(progress).toContain("Worker failed: crashed");
+    expect(progress).toContain("Prior attempt base commit: cafebabe.");
+    expect(progress).not.toContain("indeterminate: work may have landed");
+
+    expect(response.details.failed ?? []).toEqual([task.id]);
+    expect(response.details.indeterminate ?? []).toEqual([]);
+    expect(response.details.blocked ?? []).toEqual([]);
+  });
+
+  it("cancelled wave leaves queued tasks unassigned and dispatchable", async () => {
+    const store = await import("../../crew/store.ts");
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const t1 = store.createTask(dirs.cwd, "Task one", "Desc one");
+    const t2 = store.createTask(dirs.cwd, "Task two", "Desc two");
+
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string }>) => {
+      // Queue built, but the wave is cancelled before any runAgent launch:
+      // ownership must not have been written while building the queue.
+      for (const t of tasks) {
+        expect(store.getTask(dirs.cwd, t.taskId!)?.assigned_to).toBeUndefined();
+      }
+      return [];
+    });
+
+    const response = await workHandler.execute(
+      { action: "work", concurrency: 1 },
+      createDirs(dirs.cwd),
+      createMockContext(dirs.cwd),
+      () => {},
+    );
+
+    for (const task of [t1, t2]) {
+      const reloaded = store.getTask(dirs.cwd, task.id)!;
+      expect(reloaded.status).toBe("todo");
+      expect(reloaded.assigned_to).toBeUndefined();
+    }
+
+    const ready = store.getReadyTasks(dirs.cwd).map(t => t.id);
+    expect(ready).toContain(t1.id);
+    expect(ready).toContain(t2.id);
+    expect(response.details.succeeded ?? []).toEqual([]);
+    expect(response.details.failed ?? []).toEqual([]);
   });
 });

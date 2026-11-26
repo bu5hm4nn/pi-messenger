@@ -40,8 +40,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const EXTENSION_DIR = path.resolve(__dirname, "..");
 
-const IDLE_EVENT_DEDUPE_MS = 2000;
-const lastIdleEventAt = new Map<string, number>();
+// Idle advisories are transition-based: report on entering the idle state,
+// not on an elapsed-time window, so two distinct transitions inside a couple
+// of seconds both surface. Intentional teardown suppresses detection entirely.
+const idleActive = new Map<string, boolean>();
+const intentionalShutdown = new Set<string>();
 
 export const LOBBY_TOKEN_BUDGETS: Record<string, number> = {
   none: 10_000,
@@ -63,6 +66,10 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
 
   const crewDir = store.getCrewDir(cwd);
   const config = loadCrewConfig(crewDir);
+  // A new worker means the crew has left the idle state (and a fresh run is no
+  // longer an intentional shutdown).
+  intentionalShutdown.delete(cwd);
+  idleActive.delete(cwd);
   const id = randomUUID().slice(0, 6);
   let name = generateMemorableName();
   for (let i = 0; i < 5; i++) {
@@ -73,13 +80,15 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
   }
   const prompt = promptOverride ?? buildLobbyPrompt(cwd, config);
 
-  // `-ne` (--no-extensions) disables extension discovery AND the built-in
-  // extensions for the worker session; only explicit `--extension` paths load.
-  // Those paths come from the crew-worker agent's `tools` frontmatter
-  // (path-valued entries, passed below) plus EXTENSION_DIR (pi-messenger).
-  // Without it, every extension installed for the orchestrator (intercom,
-  // scrumble, …) also loads inside the crew worker and can deliver messages
-  // mid-prompt (the intercom/watcher crash).
+  // `-ne` (--no-extensions) disables automatic extension discovery and the
+  // built-in extensions for the worker session; only explicitly passed
+  // `--extension` paths load. Those paths are EXTENSION_DIR (pi-messenger) plus
+  // path-valued `tools` frontmatter entries of the crew-worker agent. A project
+  // that explicitly lists another extension (intercom, scrumble, …) will load
+  // it — `-ne` guarantees no automatic discovery, not isolation. Without it,
+  // every extension installed for the orchestrator also loads inside the
+  // crew worker and can deliver messages mid-prompt (the intercom/watcher
+  // crash).
   const args = ["--mode", "json", "--no-session", "-ne", "-p"];
   const model = resolveModel(undefined, undefined, undefined, config.models?.worker, sessionModel, workerConfig.model);
   if (model) pushModelArgs(args, model);
@@ -216,26 +225,35 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
     // spawnAgents workers are awaited synchronously by work.execute(), so a
     // lobby worker exiting autonomously is the one case where the orchestrator
     // is NOT already in control and an idle advisory is meaningful.
-    // Node serializes close handlers, but a concurrently-dying worker's
-    // exitCode can already be set before its own close handler unregisters
-    // it — dedupe (per cwd) to avoid duplicate events.
+    // Intentional teardown (session shutdown) suppresses it: those close
+    // handlers can run while the autonomous flag is still set, but they are
+    // not a crew going idle. Node serializes close handlers, so marking
+    // idleActive on the first report suppresses duplicate simultaneous exits;
+    // a later lobby-worker spawn clears the flag, allowing the next genuine
+    // transition to report.
     try {
+      if (intentionalShutdown.has(cwd)) {
+        idleActive.delete(cwd);
+        return;
+      }
       if (isAutonomousForCwd(cwd)) {
-        const now = Date.now();
-        // Dedupe per cwd: concurrent close handlers (or another autonomous
-        // project's workers) must not suppress each other's events.
-        if (now - (lastIdleEventAt.get(cwd) ?? 0) < IDLE_EVENT_DEDUPE_MS) return;
         // getLiveWorkers treats any process that has not exited as live.
         // Deliberately no !proc.killed check: `killed` means a signal was sent,
         // not that the process died — excluding such workers could fire idle
         // while a shutdown-in-flight worker is still running.
         const liveOthers = getLiveWorkers(cwd).filter(w => w !== worker);
         const outstanding = store.getTasks(cwd).filter(t => t.status === "todo" || t.status === "in_progress");
-        if (liveOthers.length === 0 && outstanding.length > 0) {
-          lastIdleEventAt.set(cwd, now);
-          logFeedEvent(cwd, "crew", "crew.idle", undefined,
-            `All crew workers exited with outstanding work: ${outstanding.map(t => t.id).join(", ")}. Autonomous continuation should resume them; if the session stopped, run pi_messenger({ action: "work", autonomous: true }).`);
+        const idleNow = liveOthers.length === 0 && outstanding.length > 0;
+        if (!idleNow) {
+          idleActive.set(cwd, false);
+          return;
         }
+        if (idleActive.get(cwd)) return;
+        idleActive.set(cwd, true);
+        logFeedEvent(cwd, "crew", "crew.idle", undefined,
+          `All crew workers exited with outstanding work: ${outstanding.map(t => t.id).join(", ")}. Autonomous continuation should resume them; if the session stopped, run pi_messenger({ action: "work", autonomous: true }).`);
+      } else {
+        idleActive.set(cwd, false);
       }
     } catch (e) {
       console.error(`[pi-messenger] crew.idle detection failed: ${e instanceof Error ? e.message : e}`);
@@ -324,6 +342,10 @@ export function killLobbyWorkerForTask(cwd: string, taskId: string): boolean {
 }
 
 export function shutdownLobbyWorkers(cwd: string): void {
+  // Session shutdown is intentional teardown, not the crew going idle: the
+  // autonomous flag may still be set while close handlers fire.
+  intentionalShutdown.add(cwd);
+  idleActive.delete(cwd);
   const all = registryGetLobbyWorkers(cwd);
   for (const worker of all) {
     if (worker.proc.exitCode === null) {

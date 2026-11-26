@@ -215,6 +215,7 @@ export async function executeReviseTree(
       assigned_to: undefined,
       summary: undefined,
       evidence: undefined,
+      completed_by: undefined,
       blocked_reason: undefined,
     });
     store.cleanupBlockFiles(cwd, task.id);

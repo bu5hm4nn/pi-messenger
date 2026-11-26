@@ -74,6 +74,138 @@ function writeText(filePath: string, content: string): void {
 }
 
 // =============================================================================
+// Per-task cross-process lock
+// =============================================================================
+//
+// Every task read-check-write (orchestrator dispatch/reset and worker
+// task.start/task.done) is serialized through a per-task lock file. A plain
+// read then rename cannot provide compare-and-swap: two processes can both
+// read rev N and both rename their own write. The lock file is created with
+// `wx` (atomic across processes), held only for the short read/modify/write,
+// and cleaned up on release. Waits are bounded; a dead holder's lock is
+// reclaimed immediately (pid gone) or after the stale timeout.
+
+const TASK_LOCK_RETRY_MS = 10;
+const TASK_LOCK_TIMEOUT_MS = 5000;
+const TASK_LOCK_STALE_MS = 30000;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function getTaskPath(cwd: string, taskId: string): string {
+  return path.join(getTasksDir(cwd), `${taskId}.json`);
+}
+
+function getTaskLockPath(cwd: string, taskId: string): string {
+  return path.join(getTasksDir(cwd), `${taskId}.lock`);
+}
+
+function isTaskLockStale(lockPath: string): boolean {
+  try {
+    const age = Date.now() - fs.statSync(lockPath).mtimeMs;
+    try {
+      const raw = JSON.parse(fs.readFileSync(lockPath, "utf-8")) as { pid?: unknown };
+      if (typeof raw.pid === "number" && raw.pid > 0) {
+        try {
+          process.kill(raw.pid, 0);
+          // A live holder is never stale, even if paused past the age limit:
+          // reclaiming its lock would allow overlapping read-modify-write.
+          return false;
+        } catch {
+          return true;
+        }
+      }
+    } catch {
+      // The holder may have created the file but not written its pid yet.
+    }
+    return age > TASK_LOCK_STALE_MS;
+  } catch {
+    // Lock disappeared between EEXIST and stat: treat as free.
+    return true;
+  }
+}
+
+function acquireTaskLock(cwd: string, taskId: string): string | null {
+  const lockPath = getTaskLockPath(cwd, taskId);
+  ensureDir(path.dirname(lockPath));
+  const deadline = Date.now() + TASK_LOCK_TIMEOUT_MS;
+
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      try {
+        fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
+      } finally {
+        fs.closeSync(fd);
+      }
+      return lockPath;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return null;
+      if (isTaskLockStale(lockPath)) {
+        try { fs.unlinkSync(lockPath); } catch {}
+        continue;
+      }
+      if (Date.now() >= deadline) return null;
+      sleepSync(TASK_LOCK_RETRY_MS);
+    }
+  }
+}
+
+function releaseTaskLock(lockPath: string): void {
+  try {
+    const raw = JSON.parse(fs.readFileSync(lockPath, "utf-8")) as { pid?: unknown };
+    if (typeof raw.pid === "number" && raw.pid !== process.pid) return;
+  } catch {
+    // Unreadable lock is ours or already gone; fall through and unlink.
+  }
+  try { fs.unlinkSync(lockPath); } catch {}
+}
+
+/**
+ * Guarded task mutation. The mutator runs against the freshly-read task while
+ * holding the per-task lock; returning null aborts without writing. Callers
+ * must express their check (status/owner/attempt budget) inside the mutator,
+ * not against a snapshot read before the call.
+ */
+export function mutateTask(
+  cwd: string,
+  taskId: string,
+  mutate: (task: Task) => Partial<Task> | null
+): Task | null {
+  const lockPath = acquireTaskLock(cwd, taskId);
+  if (!lockPath) return null;
+
+  try {
+    const task = getTask(cwd, taskId);
+    if (!task) return null;
+    const updates = mutate(task);
+    if (!updates) return null;
+
+    const updated: Task = {
+      ...task,
+      ...updates,
+      updated_at: new Date().toISOString(),
+    };
+    writeJson(getTaskPath(cwd, taskId), updated);
+    return updated;
+  } finally {
+    releaseTaskLock(lockPath);
+  }
+}
+
+/**
+ * Record dispatch ownership. Must be called immediately before a worker
+ * process is spawned, never while building a wave queue: a task cancelled
+ * before launch must not keep an assignee that never existed.
+ */
+export function claimTaskForDispatch(cwd: string, taskId: string, workerName: string): Task | null {
+  return mutateTask(cwd, taskId, task =>
+    task.status === "todo" ? { assigned_to: workerName } : null
+  );
+}
+
+// =============================================================================
 // Plan Operations
 // =============================================================================
 
@@ -250,17 +382,7 @@ export function getTask(cwd: string, taskId: string): Task | null {
 }
 
 export function updateTask(cwd: string, taskId: string, updates: Partial<Task>): Task | null {
-  const task = getTask(cwd, taskId);
-  if (!task) return null;
-
-  const updated: Task = {
-    ...task,
-    ...updates,
-    updated_at: new Date().toISOString(),
-  };
-
-  writeJson(path.join(getTasksDir(cwd), `${taskId}.json`), updated);
-  return updated;
+  return mutateTask(cwd, taskId, () => updates);
 }
 
 export function getTasks(cwd: string): Task[] {
@@ -357,34 +479,36 @@ export function getBaseCommit(cwd: string): string | undefined {
 }
 
 export function startTask(cwd: string, taskId: string, agentName: string): Task | null {
-  const task = getTask(cwd, taskId);
-  if (!task || task.status !== "todo") return null;
-
-  return updateTask(cwd, taskId, {
-    status: "in_progress",
-    started_at: new Date().toISOString(),
-    base_commit: getBaseCommit(cwd),
-    assigned_to: agentName,
-    attempt_count: task.attempt_count + 1,
-  });
+  return mutateTask(cwd, taskId, task => task.status === "todo"
+    ? {
+        status: "in_progress",
+        started_at: new Date().toISOString(),
+        base_commit: getBaseCommit(cwd),
+        assigned_to: agentName,
+        attempt_count: task.attempt_count + 1,
+      }
+    : null
+  );
 }
 
 export function completeTask(
   cwd: string,
   taskId: string,
   summary: string,
-  evidence?: TaskEvidence
+  evidence?: TaskEvidence,
+  completedBy?: string,
 ): Task | null {
-  const task = getTask(cwd, taskId);
-  if (!task || task.status !== "in_progress") return null;
-
-  const updated = updateTask(cwd, taskId, {
-    status: "done",
-    completed_at: new Date().toISOString(),
-    summary,
-    evidence,
-    assigned_to: undefined,
-  });
+  const updated = mutateTask(cwd, taskId, task => task.status === "in_progress"
+    ? {
+        status: "done",
+        completed_at: new Date().toISOString(),
+        summary,
+        evidence,
+        assigned_to: undefined,
+        completed_by: completedBy,
+      }
+    : null
+  );
 
   // Update plan completed count
   if (updated) {
@@ -400,52 +524,56 @@ export function completeTask(
 }
 
 export function blockTask(cwd: string, taskId: string, reason: string): Task | null {
-  const task = getTask(cwd, taskId);
-  if (!task) return null;
-
-  // Write block context to blocks directory
-  const blockPath = path.join(getBlocksDir(cwd), `${taskId}.md`);
-  writeText(blockPath, `# Blocked: ${task.title}\n\n**Reason:** ${reason}\n\n**Blocked at:** ${new Date().toISOString()}\n`);
-
-  return updateTask(cwd, taskId, {
+  const updated = mutateTask(cwd, taskId, () => ({
     status: "blocked",
     blocked_reason: reason,
     assigned_to: undefined,
-  });
+  }));
+  if (!updated) return null;
+
+  // Write block context to blocks directory
+  const blockPath = path.join(getBlocksDir(cwd), `${taskId}.md`);
+  writeText(blockPath, `# Blocked: ${updated.title}\n\n**Reason:** ${reason}\n\n**Blocked at:** ${new Date().toISOString()}\n`);
+
+  return updated;
 }
 
 export function unblockTask(cwd: string, taskId: string): Task | null {
-  const task = getTask(cwd, taskId);
-  if (!task || task.status !== "blocked") return null;
+  const updated = mutateTask(cwd, taskId, task => task.status === "blocked"
+    ? {
+        status: "todo",
+        blocked_reason: undefined,
+      }
+    : null
+  );
+  if (!updated) return null;
 
   cleanupBlockFiles(cwd, taskId);
-
-  return updateTask(cwd, taskId, {
-    status: "todo",
-    blocked_reason: undefined,
-  });
+  return updated;
 }
 
 export function resetTask(cwd: string, taskId: string, cascade: boolean = false): Task[] {
-  const task = getTask(cwd, taskId);
-  if (!task) return [];
-
   const resetTasks: Task[] = [];
-  const wasDone = task.status === "done";
+  let wasDone = false;
 
   // Reset this task
-  const updated = updateTask(cwd, taskId, {
-    status: "todo",
-    started_at: undefined,
-    completed_at: undefined,
-    base_commit: undefined,
-    assigned_to: undefined,
-    summary: undefined,
-    evidence: undefined,
-    blocked_reason: undefined,
-    // Keep attempt_count for tracking
+  const updated = mutateTask(cwd, taskId, task => {
+    wasDone = task.status === "done";
+    return {
+      status: "todo",
+      started_at: undefined,
+      completed_at: undefined,
+      base_commit: undefined,
+      assigned_to: undefined,
+      summary: undefined,
+      evidence: undefined,
+      completed_by: undefined,
+      blocked_reason: undefined,
+      // Keep attempt_count for tracking
+    };
   });
-  if (updated) resetTasks.push(updated);
+  if (!updated) return resetTasks;
+  resetTasks.push(updated);
 
   cleanupBlockFiles(cwd, taskId);
 

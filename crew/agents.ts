@@ -34,6 +34,7 @@ import { autonomousState, waitForConcurrencyChange } from "./state.ts";
 import { registerWorker, unregisterWorker, killAll } from "./registry.ts";
 import type { AgentTask, AgentResult } from "./types.ts";
 import { generateMemorableName } from "../lib.ts";
+import * as crewStore from "./store.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -188,9 +189,41 @@ async function runAgent(
   const agentConfig = agents.find(a => a.name === task.agent);
   const progress = createProgress(task.agent);
   const startTime = Date.now();
-  // work.execute pre-generates this so it can record the same identity on the
-  // task at dispatch; other spawn callers let runAgent generate it.
+  // work.execute pre-generates a unique dispatch identity (memorable display
+  // name plus a random suffix) so the task, PI_AGENT_NAME and the result carry
+  // the same value; other spawn callers let runAgent generate a display name.
   const workerName = task.workerName ?? generateMemorableName();
+
+  // Persist dispatch ownership at the actual launch point, not while the wave
+  // queue is built: a task cancelled before this line must keep no assignee.
+  // claimTaskForDispatch re-reads under the per-task lock; if another process
+  // claimed it first, skip this launch instead of spawning a duplicate worker.
+  if (task.workerName && task.taskId) {
+    const current = crewStore.getTask(cwd, task.taskId);
+    if (current) {
+      const claimed = crewStore.claimTaskForDispatch(cwd, task.taskId, workerName);
+      if (!claimed) {
+        const now = crewStore.getTask(cwd, task.taskId);
+        const reason = `Dispatch skipped: ${task.taskId} is ${now?.status ?? "unknown"}, not todo`;
+        progress.status = "failed";
+        progress.error = reason;
+        progress.durationMs = Date.now() - startTime;
+        return {
+          agent: task.agent,
+          exitCode: 1,
+          output: "",
+          truncated: false,
+          progress,
+          taskId: task.taskId,
+          workerName,
+          skipped: true,
+          error: reason,
+        };
+      }
+      crewStore.appendTaskProgress(cwd, task.taskId, "system",
+        `Assigned to ${task.agent} ${workerName}`);
+    }
+  }
 
   const role = agentConfig?.crewRole ?? "worker";
   const maxOutput = task.maxOutput
@@ -211,12 +244,12 @@ async function runAgent(
 
   return new Promise((resolve) => {
     // Build args for pi command.
-    // `-ne` (--no-extensions) disables extension discovery AND the built-in
-    // extensions for the worker session; only explicit `--extension` paths
-    // load. Those paths come from the spawned agent's `tools` frontmatter
-    // (path-valued entries, passed below) plus EXTENSION_DIR (pi-messenger), so
-    // orchestrator-only extensions (intercom, scrumble, …) never enter a crew
-    // worker.
+    // `-ne` (--no-extensions) disables automatic extension discovery and the
+    // built-in extensions for the worker session; only explicitly passed
+    // `--extension` paths load. Those paths are EXTENSION_DIR (pi-messenger)
+    // plus path-valued `tools` frontmatter entries of the spawned agent, so a
+    // project that explicitly lists another extension (intercom, scrumble, …)
+    // will load it — `-ne` guarantees no automatic discovery, not isolation.
     const args = ["--mode", "json", "--no-session", "-ne", "-p"];
     const model = task.modelOverride ?? config.models?.[role] ?? agentConfig?.model;
     if (model) pushModelArgs(args, model);
@@ -262,10 +295,14 @@ async function runAgent(
     args.push(task.task);
 
     const envOverrides = config.work.env ?? {};
-    const workerFlag = role === "worker"
-      ? { PI_CREW_WORKER: "1", PI_AGENT_NAME: workerName }
-      : {};
-    const env = Object.keys(envOverrides).length > 0 || role === "worker"
+    const workerFlag: Record<string, string> = {};
+    if (role === "worker") workerFlag.PI_CREW_WORKER = "1";
+    // An explicitly supplied dispatch identity must reach the worker even if a
+    // project override renamed crewRole, so task.start can record the same
+    // assigned_to the receipt carries.
+    if (task.workerName) workerFlag.PI_AGENT_NAME = task.workerName;
+    else if (role === "worker") workerFlag.PI_AGENT_NAME = workerName;
+    const env = Object.keys(envOverrides).length > 0 || Object.keys(workerFlag).length > 0
       ? { ...process.env, ...envOverrides, ...workerFlag }
       : undefined;
 

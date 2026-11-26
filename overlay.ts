@@ -751,7 +751,11 @@ export class MessengerOverlay implements Component, Focusable {
     const significant = newEvents.filter(e => MessengerOverlay.SIGNIFICANT_EVENTS.has(e.type));
     if (significant.length === 0) return;
 
-    const last = significant[significant.length - 1];
+    // An unseen crew.idle must not be discarded by a later significant event
+    // in the same batch (e.g. a task.done from the wave that just resumed).
+    // Prefer the last idle event for the flash; otherwise keep the latest.
+    const idle = significant.filter(e => e.type === "crew.idle").at(-1);
+    const last = idle ?? significant[significant.length - 1];
     const sameType = significant.filter(e => e.type === last.type);
 
     let message: string;

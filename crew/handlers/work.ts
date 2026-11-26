@@ -209,14 +209,39 @@ export async function execute(
     };
   });
 
-  const workerResults = await spawnAgents(
-    workerTasks,
-    cwd,
-    {
-      signal,
-      messengerDirs: { registry: dirs.registry, inbox: dirs.inbox },
+  // Mark the run stopped as soon as the signal fires, not after receipts are
+  // processed. Aborting the work tool can leave workers draining while their
+  // receipts are classified; a lobby worker closing during that window is part
+  // of the cancellation, not the crew going idle, so the autonomous flag must
+  // already be cleared when its close handler runs.
+  let abortHandled = false;
+  const handleAbort = () => {
+    if (abortHandled) return;
+    abortHandled = true;
+    if (isAutonomousForCwd(cwd)) {
+      stopAutonomous("manual");
+      appendEntry("crew-state", autonomousState);
     }
-  );
+  };
+  if (signal) {
+    if (signal.aborted) handleAbort();
+    else signal.addEventListener("abort", handleAbort, { once: true });
+  }
+
+  let workerResults;
+  try {
+    workerResults = await spawnAgents(
+      workerTasks,
+      cwd,
+      {
+        signal,
+        messengerDirs: { registry: dirs.registry, inbox: dirs.inbox },
+      }
+    );
+  } catch (err) {
+    signal?.removeEventListener("abort", handleAbort);
+    throw err;
+  }
 
   // Process results
   const succeeded: string[] = [];
@@ -518,6 +543,10 @@ export async function execute(
 
   syncCompletedCount(cwd);
 
+  // The drain window is over: a later abort is handled by the post-processing
+  // branch below.
+  signal?.removeEventListener("abort", handleAbort);
+
   // Save current wave number BEFORE addWaveResult increments it
   const currentWave = autonomous ? autonomousState.waveNumber : 1;
   
@@ -533,8 +562,12 @@ export async function execute(
     });
 
     if (signal?.aborted) {
-      stopAutonomous("manual");
-      appendEntry("crew-state", autonomousState);
+      // The abort listener already stopped the run; only persist state if it
+      // somehow has not (e.g. re-entered with an already-aborted signal).
+      if (isAutonomousForCwd(cwd)) {
+        stopAutonomous("manual");
+        appendEntry("crew-state", autonomousState);
+      }
     } else {
       const nextReady = store.getReadyTasks(cwd, { advisory: config.dependencies === "advisory" }).filter(t => !teamStore.taskNeedsApproval(t));
       const allTasks = store.getTasks(cwd);

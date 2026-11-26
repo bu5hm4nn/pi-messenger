@@ -101,6 +101,58 @@ describe("crew idle transition detection", () => {
     expect(crewIdleEvents(dirs.cwd)).toHaveLength(0);
   });
 
+  it("a lobby close during an aborted wave's receipt drain emits no crew.idle", async () => {
+    const workHandler = await import("../../crew/handlers/work.ts");
+    const agents = await import("../../crew/agents.ts");
+    const task = store.getTasks(dirs.cwd)[0];
+
+    const controller = new AbortController();
+    let worker: ReturnType<typeof spawnLobbyWorker> | null = null;
+
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async () => {
+      worker = spawnLobbyWorker(dirs.cwd);
+      // The work tool is aborted while the wave is still draining; the run
+      // must be marked stopped here, before receipts are classified.
+      controller.abort();
+      expect(state.autonomousState.active).toBe(false);
+      // Receipt arrives for the still-unclaimed task, so result processing
+      // continues into the drain window.
+      return [{
+        agent: "crew-worker",
+        exitCode: 0,
+        output: "",
+        truncated: false,
+        progress: { agent: "crew-worker", status: "completed" as const, recentTools: [], toolCallCount: 0, tokens: 0, durationMs: 0 },
+        taskId: task.id,
+        workerName: "WaveAWorker",
+      }];
+    });
+
+    // Fire the lobby worker's close while work is processing receipts.
+    const originalGetTask = store.getTask.bind(store);
+    let fired = false;
+    vi.spyOn(store, "getTask").mockImplementation((cwd: string, id: string) => {
+      if (!fired && worker) {
+        fired = true;
+        const proc = worker.proc as unknown as MockProc;
+        proc.exitCode = 0;
+        proc.fire("close", 0);
+      }
+      return originalGetTask(cwd, id);
+    });
+
+    await workHandler.execute(
+      { action: "work", autonomous: true },
+      { base: path.join(dirs.cwd, ".pi", "messenger"), registry: path.join(dirs.cwd, ".pi", "messenger", "registry"), inbox: path.join(dirs.cwd, ".pi", "messenger", "inbox") },
+      { cwd: dirs.cwd, hasUI: false, ui: { theme: { fg: (_c: string, t: string) => t }, notify: vi.fn(), setStatus: vi.fn() }, sessionManager: { getEntries: () => [], getSessionId: () => "test" } } as never,
+      () => {},
+      controller.signal,
+    );
+
+    expect(fired).toBe(true);
+    expect(crewIdleEvents(dirs.cwd)).toHaveLength(0);
+  });
+
   it("reports two distinct idle transitions even inside the old two-second window", () => {
     const first = spawnLobbyWorker(dirs.cwd)!;
     const second = spawnLobbyWorker(dirs.cwd)!;

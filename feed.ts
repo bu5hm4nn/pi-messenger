@@ -6,6 +6,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { acquireDirMutex, releaseDirMutex } from "./dir-mutex.ts";
 
 export type FeedEventType =
   | "join"
@@ -41,6 +42,12 @@ export type FeedEventType =
 
 export interface FeedEvent {
   ts: string;
+  /**
+   * Monotonically increasing identity assigned at write time. The overlay
+   * advances its cursor on seq, so events sharing a timestamp are all seen.
+   * Absent on lines written before the field existed.
+   */
+  seq?: number;
   agent: string;
   type: FeedEventType;
   target?: string;
@@ -69,11 +76,28 @@ function sanitizeAgentName(value: string): string {
 export function sanitizeFeedEvent(event: FeedEvent): FeedEvent {
   return {
     ts: event.ts,
+    seq: typeof event.seq === "number" && Number.isFinite(event.seq) && event.seq >= 0
+      ? Math.trunc(event.seq)
+      : undefined,
     type: event.type,
     agent: sanitizeAgentName(event.agent),
     target: sanitizeInlineText(event.target),
     preview: sanitizeInlineText(event.preview),
   };
+}
+
+/**
+ * Allocate the next feed sequence. Callers must hold the feed sequence guard
+ * so read-max + append is one critical section across processes.
+ */
+function nextFeedSeq(cwd: string): number {
+  // A short tail scan survives a malformed last line without restarting at 1.
+  const recent = readFeedEvents(cwd, 8);
+  let max = 0;
+  for (const event of recent) {
+    if (typeof event.seq === "number" && event.seq > max) max = event.seq;
+  }
+  return max + 1;
 }
 
 export function appendFeedEvent(cwd: string, event: FeedEvent): void {
@@ -83,8 +107,22 @@ export function appendFeedEvent(cwd: string, event: FeedEvent): void {
     if (!fs.existsSync(feedDir)) {
       fs.mkdirSync(feedDir, { recursive: true });
     }
-    const sanitized = sanitizeFeedEvent(event);
-    fs.appendFileSync(p, JSON.stringify(sanitized) + "\n");
+
+    // Sequence allocation and the append are one critical section: two
+    // processes appending in the same millisecond must not share a seq, or the
+    // overlay cursor would skip one of them.
+    let guard = null;
+    try {
+      guard = acquireDirMutex(path.join(feedDir, ".feed-seq"), { timeoutMs: 2000 });
+    } catch {
+      // Feed writes are best effort; fall through with a computed sequence.
+    }
+    try {
+      const sanitized = sanitizeFeedEvent({ ...event, seq: nextFeedSeq(cwd) });
+      fs.appendFileSync(p, JSON.stringify(sanitized) + "\n");
+    } finally {
+      if (guard) releaseDirMutex(guard);
+    }
   } catch {
     // Best effort
   }

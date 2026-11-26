@@ -29,8 +29,11 @@ export interface CrewViewState {
   inputMode: "normal" | "block-reason" | "message" | "revise-prompt";
   reviseScope: "single" | "tree";
   revisePromptInput: string;
-  lastSeenEventTs: string | null;
+  /** Feed identity cursor: the highest event seq already rendered. */
+  lastSeenEventSeq: number | null;
   notification: { message: string; expiresAt: number } | null;
+  /** Flashes that arrived while another was visible; shown one at a time. */
+  pendingNotifications: string[];
   notificationTimer: ReturnType<typeof setTimeout> | null;
   feedFocus: boolean;
   mentionCandidates: string[];
@@ -50,8 +53,9 @@ export function createCrewViewState(): CrewViewState {
     inputMode: "normal",
     reviseScope: "single",
     revisePromptInput: "",
-    lastSeenEventTs: null,
+    lastSeenEventSeq: null,
     notification: null,
+    pendingNotifications: [],
     notificationTimer: null,
     feedFocus: false,
     mentionCandidates: [],
@@ -92,13 +96,38 @@ function executeTaskAction(
   return { success: result.success, message: result.message };
 }
 
-export function setNotification(viewState: CrewViewState, tui: TUI, success: boolean, message: string): void {
+function showNotification(viewState: CrewViewState, tui: TUI, message: string): void {
   if (viewState.notificationTimer) clearTimeout(viewState.notificationTimer);
-  viewState.notification = { message: `${success ? "✓" : "✗"} ${message}`, expiresAt: Date.now() + 2000 };
+  viewState.notification = { message, expiresAt: Date.now() + 2000 };
   viewState.notificationTimer = setTimeout(() => {
     viewState.notificationTimer = null;
+    const next = viewState.pendingNotifications.shift();
+    if (next) {
+      showNotification(viewState, tui, next);
+      tui.requestRender();
+      return;
+    }
     tui.requestRender();
   }, 2000);
+}
+
+export function setNotification(
+  viewState: CrewViewState,
+  tui: TUI,
+  success: boolean,
+  message: string,
+  queueIfBusy = false,
+): void {
+  const text = `${success ? "✓" : "✗"} ${message}`;
+  if (queueIfBusy && viewState.notification && Date.now() < viewState.notification.expiresAt) {
+    // Two unseen transitions in one batch must both surface; queue the later
+    // one instead of overwriting (or collapsing into) the visible flash.
+    if (viewState.pendingNotifications.length < 10) {
+      viewState.pendingNotifications.push(text);
+    }
+    return;
+  }
+  showNotification(viewState, tui, text);
 }
 
 function addToChatHistory(state: MessengerState, recipient: string, message: AgentMailMessage): void {

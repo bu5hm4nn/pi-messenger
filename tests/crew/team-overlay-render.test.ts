@@ -9,15 +9,25 @@ import type { FeedEvent } from "../../feed.ts";
 
 const theme = { fg: (_color: string, text: string) => text } as any;
 
-function flashEvents(events: FeedEvent[], prevTs: string | null) {
+function flashEvents(events: FeedEvent[], prevSeq: number | null, keepTimers = false) {
   const tui = { requestRender: vi.fn() } as any;
   const overlay = Object.create(MessengerOverlay.prototype) as any;
   overlay.crewViewState = createCrewViewState();
   overlay.tui = tui;
-  overlay.detectAndFlashEvents(events, prevTs);
+  overlay.detectAndFlashEvents(events, prevSeq);
   const viewState = overlay.crewViewState as ReturnType<typeof createCrewViewState>;
-  if (viewState.notificationTimer) clearTimeout(viewState.notificationTimer);
+  if (!keepTimers && viewState.notificationTimer) clearTimeout(viewState.notificationTimer);
   return viewState;
+}
+
+function event(seq: number, type: FeedEvent["type"], extra: Partial<FeedEvent> = {}): FeedEvent {
+  return {
+    ts: "2026-01-01T00:00:01.000Z",
+    seq,
+    agent: "crew",
+    type,
+    ...extra,
+  };
 }
 
 describe("Team overlay render signals", () => {
@@ -43,53 +53,75 @@ describe("Team overlay render signals", () => {
 describe("Crew idle overlay flash", () => {
   it("flashes crew.idle with a readable label instead of the raw type", () => {
     const viewState = flashEvents([
-      {
-        ts: "2026-01-01T00:00:01.000Z",
-        agent: "crew",
-        type: "crew.idle",
-        preview: "All crew workers exited with outstanding work: task-1",
-      },
-    ], "2026-01-01T00:00:00.000Z");
+      event(11, "crew.idle", { preview: "All crew workers exited with outstanding work: task-1" }),
+    ], 10);
 
     expect(viewState.notification?.message).toContain("crew idle");
     expect(viewState.notification?.message).not.toContain("crew.idle");
   });
 
-  it("keeps sameType pluralization for repeated crew.idle events", () => {
-    const viewState = flashEvents([
-      { ts: "2026-01-01T00:00:01.000Z", agent: "crew", type: "crew.idle", preview: "first" },
-      { ts: "2026-01-01T00:00:02.000Z", agent: "crew", type: "crew.idle", preview: "second" },
-    ], "2026-01-01T00:00:00.000Z");
-
-    expect(viewState.notification?.message).toContain("2 crew idle events");
-  });
-
   it("does not discard an unseen crew.idle when a later significant event is in the same batch", () => {
     const viewState = flashEvents([
-      { ts: "2026-01-01T00:00:01.000Z", agent: "crew", type: "crew.idle", preview: "outstanding work" },
-      { ts: "2026-01-01T00:00:02.000Z", agent: "WorkerOne", type: "task.done", target: "task-1", preview: "done" },
-    ], "2026-01-01T00:00:00.000Z");
+      event(11, "crew.idle", { preview: "outstanding work" }),
+      event(12, "task.done", { agent: "WorkerOne", target: "task-1", preview: "done" }),
+    ], 10);
 
     expect(viewState.notification?.message).toContain("crew idle");
+    // The later task.done still surfaces after the idle flash.
+    expect(viewState.pendingNotifications.join(" ")).toContain("completed");
   });
 
   it("flashes two distinct idle transitions observed in separate batches", () => {
-    const first = flashEvents([
-      { ts: "2026-01-01T00:00:01.000Z", agent: "crew", type: "crew.idle", preview: "first transition" },
-    ], "2026-01-01T00:00:00.000Z");
-    const second = flashEvents([
-      { ts: "2026-01-01T00:00:02.000Z", agent: "crew", type: "crew.idle", preview: "second transition" },
-    ], "2026-01-01T00:00:01.000Z");
+    const first = flashEvents([event(11, "crew.idle", { preview: "first transition" })], 10);
+    const second = flashEvents([event(12, "crew.idle", { preview: "second transition" })], 11);
 
     expect(first.notification?.message).toContain("crew idle");
     expect(second.notification?.message).toContain("crew idle");
   });
 
   it("does not flash an already-seen crew.idle event", () => {
-    const viewState = flashEvents([
-      { ts: "2026-01-01T00:00:00.000Z", agent: "crew", type: "crew.idle", preview: "seen" },
-    ], "2026-01-01T00:00:00.000Z");
+    const viewState = flashEvents([event(11, "crew.idle", { preview: "seen" })], 11);
 
     expect(viewState.notification).toBeNull();
+  });
+
+  it("flashes two unseen idle transitions in one batch as two distinct flashes", () => {
+    vi.useFakeTimers();
+    try {
+      const viewState = flashEvents([
+        event(11, "crew.idle", { preview: "first transition" }),
+        event(12, "crew.idle", { preview: "second transition" }),
+      ], 10, true);
+
+      expect(viewState.notification?.message).toContain("crew idle");
+      expect(viewState.pendingNotifications).toHaveLength(1);
+      expect(viewState.pendingNotifications[0]).toContain("crew idle");
+
+      // After the first flash expires the queued transition is shown, so both
+      // transitions surface instead of being coalesced into one.
+      vi.advanceTimersByTime(2000);
+      expect(viewState.notification?.message).toContain("crew idle");
+      expect(viewState.pendingNotifications).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("flashes equal-timestamp events separately (identity is seq, not ts)", () => {
+    vi.useFakeTimers();
+    try {
+      const ts = "2026-01-01T00:00:02.000Z";
+      const viewState = flashEvents([
+        { ts, seq: 21, agent: "crew", type: "task.done", target: "task-1" },
+        { ts, seq: 22, agent: "crew", type: "task.block", target: "task-2", preview: "stuck" },
+      ], 20, true);
+
+      expect(viewState.notification?.message).toContain("completed");
+      expect(viewState.pendingNotifications.join(" ")).toContain("blocked");
+      vi.advanceTimersByTime(2000);
+      expect(viewState.notification?.message).toContain("blocked");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

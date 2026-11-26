@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { formatFeedLine, isCrewEvent, logFeedEvent, pruneFeed, readFeedEvents } from "../feed.ts";
+import { appendFeedEvent, formatFeedLine, isCrewEvent, logFeedEvent, pruneFeed, readFeedEvents } from "../feed.ts";
 import { createTempCrewDirs } from "./helpers/temp-dirs.ts";
 
 describe("feed", () => {
@@ -46,6 +46,21 @@ describe("feed", () => {
     fs.writeFileSync(feedFile, `${events.join("\n")}\n`);
 
     expect(readFeedEvents(cwd, 2).map(event => event.preview?.split(":")[0])).toEqual(["598", "599"]);
+  });
+
+  it("assigns a strictly increasing seq at write time, even for equal timestamps", () => {
+    const ts = new Date("2026-01-01T00:00:00.000Z").toISOString();
+    // Two writers, same millisecond: identity must still be distinct.
+    appendFeedEvent(cwd, { ts, agent: "AgentOne", type: "task.done", target: "task-1" });
+    appendFeedEvent(cwd, { ts, agent: "AgentOne", type: "crew.idle" });
+
+    const events = readFeedEvents(cwd, 20);
+    expect(events.map(event => event.ts)).toEqual([ts, ts]);
+    expect(events.map(event => event.seq)).toEqual([1, 2]);
+
+    // The sequence survives pruning: it is part of the line, not a position.
+    pruneFeed(cwd, 1);
+    expect(readFeedEvents(cwd, 20).map(event => event.seq)).toEqual([2]);
   });
 
   it("returns no events for non-positive limits", () => {

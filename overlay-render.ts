@@ -231,14 +231,16 @@ export function renderTaskSummary(theme: Theme, cwd: string, width: number, heig
 
 const DIM_EVENTS = new Set(["join", "leave", "reserve", "release", "plan.pass.start", "plan.pass.done", "plan.review.start", "plan.review.done"]);
 
-export function renderFeedSection(theme: Theme, events: FeedEvent[], width: number, lastSeenTs: string | null): string[] {
+export function renderFeedSection(theme: Theme, events: FeedEvent[], width: number, lastSeenSeq: number | null): string[] {
   if (events.length === 0) return [];
   const lines: string[] = [];
   let lastWasMessage = false;
 
   for (const event of events) {
     const sanitized = sanitizeFeedEvent(event);
-    const isNew = lastSeenTs === null || sanitized.ts > lastSeenTs;
+    // seq-based: equal timestamps are distinct events. Legacy lines without a
+    // seq are treated as already seen once a cursor exists.
+    const isNew = lastSeenSeq === null || (sanitized.seq ?? 0) > lastSeenSeq;
     const isMessage = sanitized.type === "message";
 
     if (lines.length > 0 && isMessage !== lastWasMessage) {

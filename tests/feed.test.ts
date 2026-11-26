@@ -94,6 +94,22 @@ describe("feed", () => {
     expect(events[0]?.target).toBe("b.ts");
   });
 
+  it("reports a dropped append when the feed lock cannot be acquired", () => {
+    const feedFile = path.join(cwd, ".pi", "messenger", "feed.jsonl");
+    const guard = acquireDirMutex(path.join(path.dirname(feedFile), ".feed-seq"));
+    try {
+      expect(appendFeedEvent(cwd, {
+        ts: new Date().toISOString(),
+        agent: "AgentOne",
+        type: "task.done",
+        target: "task-1",
+      })).toBe(false);
+    } finally {
+      releaseDirMutex(guard);
+    }
+    expect(readFeedEvents(cwd, 20)).toEqual([]);
+  });
+
   it("does not prune while an append holds the feed-sequence guard", () => {
     logFeedEvent(cwd, "AgentOne", "join");
     logFeedEvent(cwd, "AgentOne", "edit", "a.ts");

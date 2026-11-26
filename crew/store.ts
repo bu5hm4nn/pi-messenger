@@ -145,6 +145,44 @@ function getTaskSpecPath(cwd: string, taskId: string): string {
   return path.join(getTasksDir(cwd), `${taskId}.md`);
 }
 
+function getTaskSpecPathForVersion(cwd: string, taskId: string, version: number): string {
+  return version > 0
+    ? path.join(getTasksDir(cwd), `${taskId}.spec.${version}.md`)
+    : getTaskSpecPath(cwd, taskId);
+}
+
+function getTaskSpecPathForTask(cwd: string, task: Task): string {
+  return getTaskSpecPathForVersion(cwd, task.id, task.spec_version ?? 0);
+}
+
+/** All spec artifacts for a task, including superseded generations. */
+function getTaskSpecFileNames(cwd: string, taskId: string): string[] {
+  const dir = getTasksDir(cwd);
+  let entries: string[];
+  try { entries = fs.readdirSync(dir); } catch { return []; }
+  return entries
+    .filter(name =>
+      name === `${taskId}.md` ||
+      (name.startsWith(`${taskId}.spec.`) && name.endsWith(".md")),
+    )
+    .map(name => path.join(dir, name));
+}
+
+function removeTaskSpecFiles(cwd: string, taskId: string): void {
+  for (const filePath of getTaskSpecFileNames(cwd, taskId)) {
+    unlinkIfExists(filePath);
+  }
+}
+
+/** Best-effort removal of generations the committed JSON no longer selects. */
+function removeSupersededTaskSpecs(cwd: string, taskId: string, keepVersion: number): void {
+  const keep = getTaskSpecPathForVersion(cwd, taskId, keepVersion);
+  for (const filePath of getTaskSpecFileNames(cwd, taskId)) {
+    if (filePath === keep) continue;
+    try { fs.unlinkSync(filePath); } catch {}
+  }
+}
+
 /** Directory-mutex handle for a task guard (exported for lifecycle/tests). */
 export type TaskGuardHandle = DirMutexHandle;
 
@@ -182,6 +220,13 @@ export function setGuardLivenessProbe(probe: ((pid: number) => "alive" | "dead" 
   setDirMutexLivenessProbe(probe);
 }
 
+let dependentScanProbe: (() => void) | null = null;
+
+/** Test seam fired after deleteTask snapshots its dependent list; inert in production. */
+export function setDependentScanProbe(probe: (() => void) | null): void {
+  dependentScanProbe = probe;
+}
+
 export { DirMutexTimeoutError as TaskLockTimeoutError };
 
 /**
@@ -211,11 +256,16 @@ export interface TaskMutationContext {
 
 export interface TaskMutationOptions {
   /**
-   * Publish a companion file (e.g. the task spec) while the per-task guard is
-   * still held. The task JSON has already been written when this runs, so a
-   * stale generation/rev precondition fails before the companion is touched.
+   * Write companion state (e.g. a generation-named spec file) while the
+   * per-task guard is held, BEFORE the task JSON commit. A throw aborts the
+   * mutation with the old JSON still pointing at the old, still-valid file.
    */
-  publish?: (task: Task) => void;
+  prepare?: (task: Task, updated: Task) => void;
+  /**
+   * Best-effort cleanup after the JSON commit succeeded (e.g. removing
+   * superseded spec generations). Errors are swallowed: orphans are harmless.
+   */
+  afterCommit?: (updated: Task) => void;
 }
 
 /**
@@ -257,6 +307,9 @@ export function mutateTask(
     const taskPath = getTaskPath(cwd, taskId);
     const temp = stageFile(taskPath, JSON.stringify(updated, null, 2));
     try {
+      // Companion first: if this throws, the JSON is never committed and the
+      // old record still selects a complete, readable spec generation.
+      options?.prepare?.(task, updated);
       if (!fs.existsSync(path.join(guard.guardPath, guard.markerName))) {
         throw new TaskLockLostError(guard.guardPath, guard.markerName);
       }
@@ -266,7 +319,11 @@ export function mutateTask(
       throw err;
     }
 
-    options?.publish?.(updated);
+    try {
+      options?.afterCommit?.(updated);
+    } catch {
+      // Orphaned generations are harmless; never fail a committed mutation.
+    }
     return updated;
   } finally {
     releaseTaskGuard(guard);
@@ -379,9 +436,10 @@ export function deletePlan(cwd: string): boolean {
       const guard = tryAcquireTaskGuard(cwd, taskId);
       if (!guard) continue;
       try {
-        for (const ext of [".json", ".md", ".progress.md"]) {
+        for (const ext of [".json", ".progress.md"]) {
           unlinkIfExists(path.join(tasksDir, `${taskId}${ext}`));
         }
+        removeTaskSpecFiles(cwd, taskId);
         unlinkIfExists(path.join(blocksDir, `${taskId}.md`));
       } finally {
         releaseTaskGuard(guard);
@@ -448,6 +506,7 @@ export function createTask(
         throw err;
       }
 
+      const specVersion = 1;
       task = {
         id,
         title,
@@ -461,17 +520,25 @@ export function createTask(
         created_at: now,
         updated_at: now,
         attempt_count: 0,
+        spec_version: specVersion,
       };
 
-      writeJson(taskPath, task);
-
-      // Publish the initial spec under the same alloc lock as the JSON:
-      // releasing between the two lets deletePlan see the JSON without the
-      // spec (or vice versa) and splits one task across two critical sections.
+      // Write the generation-named spec FIRST, then commit the JSON that
+      // selects it. Readers never observe a task record whose selected spec
+      // generation does not exist; a failed spec write leaves only the empty
+      // reservation placeholder, which getTask ignores.
       const specContent = description
         ? `# ${title}\n\n${description}\n`
         : `# ${title}\n\n*Spec pending*\n`;
-      writeText(getTaskSpecPath(cwd, id), specContent);
+      const specPath = getTaskSpecPathForVersion(cwd, id, specVersion);
+      try {
+        writeText(specPath, specContent);
+        writeJson(taskPath, task);
+      } catch (err) {
+        try { fs.unlinkSync(specPath); } catch {}
+        try { fs.unlinkSync(taskPath); } catch {}
+        throw err;
+      }
       break;
     }
 
@@ -519,6 +586,8 @@ function normalizeTask(raw: Task): Task {
     completed_dispatch: typeof raw.completed_dispatch === "string" ? raw.completed_dispatch : undefined,
     rev: typeof raw.rev === "number" ? raw.rev : 0,
     generation: typeof raw.generation === "number" ? raw.generation : 0,
+    spec_version: typeof raw.spec_version === "number" && raw.spec_version > 0 ? raw.spec_version : 0,
+    pending_split: raw.pending_split === true ? true : undefined,
   };
 }
 
@@ -539,6 +608,7 @@ const LIFECYCLE_FIELDS = [
   "attempt_count",
   "completed_by",
   "completed_dispatch",
+  "pending_split",
 ] as const;
 
 export function updateTask(cwd: string, taskId: string, updates: Partial<Task>): Task | null {
@@ -572,8 +642,15 @@ export function getTasks(cwd: string): Task[] {
   });
 }
 
+/** Read the spec generation selected by the task JSON (the only pointer). */
+export function getTaskSpecFor(cwd: string, task: Task): string | null {
+  return readText(getTaskSpecPathForTask(cwd, task));
+}
+
 export function getTaskSpec(cwd: string, taskId: string): string | null {
-  return readText(getTaskSpecPath(cwd, taskId));
+  const task = getTask(cwd, taskId);
+  if (!task) return null;
+  return getTaskSpecFor(cwd, task);
 }
 
 export function appendTaskProgress(cwd: string, taskId: string, agent: string, message: string): void {
@@ -642,17 +719,25 @@ export function applyTaskRevision(
   revision: TaskRevisionInput,
   options?: SpecEditOptions,
 ): Task | null {
-  // The generation bump (task JSON) and the spec publication happen under the
-  // same per-task guard: a reader that takes the guard cannot observe one
-  // without the other, and a stale edit aborts before the spec is touched.
+  // The spec content is written to a new generation-named file while the
+  // guard is held, then the JSON commit atomically selects it. A reader can
+  // only ever see an old JSON + old file or a new JSON + new file; a thrown
+  // spec write leaves the old JSON pointing at the still-valid old file.
   return mutateTask(cwd, taskId, task => {
     assertGeneration(task, options);
     return {
       ...(revision.title ? { title: revision.title } : {}),
       generation: (task.generation ?? 0) + 1,
+      spec_version: (task.spec_version ?? 0) + 1,
     };
   }, {
-    publish: () => writeText(getTaskSpecPath(cwd, taskId), revision.spec),
+    prepare: (_task, updated) => {
+      const version = updated.spec_version ?? 1;
+      writeText(getTaskSpecPathForVersion(cwd, taskId, version), revision.spec);
+    },
+    afterCommit: updated => {
+      removeSupersededTaskSpecs(cwd, taskId, updated.spec_version ?? 0);
+    },
   });
 }
 
@@ -670,9 +755,10 @@ export function deleteTask(cwd: string, taskId: string): boolean {
     if (!task) return false;
 
     const tasksDir = getTasksDir(cwd);
-    for (const ext of [".json", ".md", ".progress.md"]) {
+    for (const ext of [".json", ".progress.md"]) {
       try { fs.unlinkSync(path.join(tasksDir, `${taskId}${ext}`)); } catch {}
     }
+    removeTaskSpecFiles(cwd, taskId);
 
     try { fs.unlinkSync(path.join(getBlocksDir(cwd), `${taskId}.md`)); } catch {}
   } finally {
@@ -681,7 +767,13 @@ export function deleteTask(cwd: string, taskId: string): boolean {
 
   // Dependents: the filter is computed from the task state read *inside* the
   // dependent's mutation, so a dependency added after our snapshot survives.
-  for (const t of getTasks(cwd)) {
+  const dependents = getTasks(cwd);
+  try {
+    dependentScanProbe?.();
+  } catch {
+    // Test seam only; must never affect the delete.
+  }
+  for (const t of dependents) {
     if (!t.depends_on.includes(taskId)) continue;
     mutateTask(cwd, t.id, current =>
       current.depends_on.includes(taskId)
@@ -700,6 +792,41 @@ export function deleteTask(cwd: string, taskId: string): boolean {
   }
 
   return true;
+}
+
+/**
+ * Best-effort rollback for a task created by a decision that was never
+ * committed (e.g. a split whose milestone link was refused). Only an untouched
+ * todo task with no attempt charge, reservation, dependents or milestone is
+ * removed; anything a concurrent wave may already own is left alone.
+ */
+export function discardUnclaimedTask(cwd: string, taskId: string): boolean {
+  const guard = acquireTaskGuard(cwd, taskId);
+  let removed = false;
+  try {
+    const task = getTask(cwd, taskId);
+    if (!task) return false;
+    if (task.status !== "todo" || task.dispatch_token !== undefined) return false;
+    if (task.milestone || task.pending_split) return false;
+    if ((task.attempt_count ?? 0) !== 0) return false;
+    if (getTasks(cwd).some(t => t.depends_on.includes(taskId))) return false;
+
+    const tasksDir = getTasksDir(cwd);
+    for (const ext of [".json", ".progress.md"]) {
+      try { fs.unlinkSync(path.join(tasksDir, `${taskId}${ext}`)); } catch {}
+    }
+    removeTaskSpecFiles(cwd, taskId);
+    try { fs.unlinkSync(path.join(getBlocksDir(cwd), `${taskId}.md`)); } catch {}
+    removed = true;
+  } finally {
+    releaseTaskGuard(guard);
+  }
+
+  if (removed) {
+    const plan = getPlan(cwd);
+    if (plan) updatePlan(cwd, { task_count: Math.max(0, plan.task_count - 1) });
+  }
+  return removed;
 }
 
 // =============================================================================
@@ -740,6 +867,7 @@ export function claimTaskForDispatch(
   const maxAttempts = options?.maxAttempts ?? Number.POSITIVE_INFINITY;
   return mutateTask(cwd, taskId, task => {
     if (task.status !== "todo") return null;
+    if (task.pending_split) return null;
     if (task.dispatch_token) return null;
     const attemptCount = task.attempt_count ?? 0;
     if (attemptCount >= maxAttempts) return null;
@@ -788,6 +916,7 @@ export function startTask(
   const dispatchToken = options?.dispatchToken;
   return mutateTask(cwd, taskId, task => {
     if (task.status !== "todo") return null;
+    if (task.pending_split) return null;
     if (dispatchToken !== undefined) {
       if (task.dispatch_token !== dispatchToken) return null;
     } else if (task.dispatch_token !== undefined) {
@@ -828,6 +957,7 @@ export function completeTask(
   const dispatchToken = options?.dispatchToken;
   const updated = mutateTask(cwd, taskId, task => {
     if (task.status !== "in_progress") return null;
+    if (task.pending_split) return null;
     if (dispatchToken !== undefined) {
       if (task.dispatch_token !== dispatchToken) return null;
     } else {
@@ -1036,8 +1166,14 @@ export interface ExitAttemptResult {
   outcome: "blocked" | "todo" | "missing" | "changed";
   /** Updated task after an accepted exit (null when refused/missing). */
   task: Task | null;
-  /** Validated prior-attempt snapshot captured under the guard. */
+  /**
+   * Validated prior-attempt snapshot captured under the guard. Only present
+   * for an accepted exit; a refusal never returns it, so callers cannot emit a
+   * reconcile note for an attempt this dispatch did not own.
+   */
   previous: Task | null;
+  /** Typed refusal reason (present when outcome is changed/missing). */
+  reason?: string;
 }
 
 /**
@@ -1050,16 +1186,28 @@ export interface ExitAttemptResult {
 export function exitAttempt(cwd: string, taskId: string, options: ExitAttemptOptions = {}): ExitAttemptResult {
   let outcome: ExitAttemptResult["outcome"] = "changed";
   let previous: Task | null = null;
+  let refusal: string | undefined;
   const updated = mutateTask(cwd, taskId, task => {
-    previous = task;
-    if (options.dispatchToken !== undefined && task.dispatch_token !== options.dispatchToken) return null;
-    if (options.owner !== undefined && task.assigned_to !== options.owner) return null;
+    if (options.dispatchToken !== undefined && task.dispatch_token !== options.dispatchToken) {
+      refusal = "dispatch_token_mismatch";
+      return null;
+    }
+    if (options.owner !== undefined && task.assigned_to !== options.owner) {
+      refusal = "owner_mismatch";
+      return null;
+    }
     if (task.status === "todo") {
-      if (!task.dispatch_token) return null;
+      if (!task.dispatch_token) {
+        refusal = "no_live_reservation";
+        return null;
+      }
     } else if (task.status !== "in_progress") {
+      refusal = `status_${task.status}`;
       return null;
     }
 
+    // All fences passed: this is the snapshot the caller may use for notes.
+    previous = task;
     const maxAttempts = options.maxAttempts ?? Number.POSITIVE_INFINITY;
     if ((task.attempt_count ?? 0) >= maxAttempts) {
       outcome = "blocked";
@@ -1075,7 +1223,13 @@ export function exitAttempt(cwd: string, taskId: string, options: ExitAttemptOpt
   });
 
   if (updated) return { outcome, task: updated, previous };
-  return { outcome: getTask(cwd, taskId) ? "changed" : "missing", task: null, previous };
+  const missing = !getTask(cwd, taskId);
+  return {
+    outcome: missing ? "missing" : "changed",
+    task: null,
+    previous: null,
+    reason: missing ? "task_missing" : refusal ?? "status_changed",
+  };
 }
 
 // =============================================================================
@@ -1145,7 +1299,7 @@ export function applyReview(
 
 /** A todo task carrying a dispatch token is reserved: not ready to launch. */
 function isDispatchable(task: Task): boolean {
-  return task.status === "todo" && !task.dispatch_token;
+  return task.status === "todo" && !task.dispatch_token && !task.pending_split;
 }
 
 export function getReadyTasksFrom(tasks: Task[], options?: { advisory?: boolean }): Task[] {
@@ -1172,7 +1326,7 @@ export function autoCompleteMilestones(cwd: string): void {
     for (const task of tasks) {
       if (!task.milestone || !isDispatchable(task)) continue;
       const completed = mutateTask(cwd, task.id, current => {
-        if (!current.milestone || !isDispatchable(current)) return null;
+        if (!current.milestone || !isDispatchable(current) || current.pending_split) return null;
         const allDepsDone = current.depends_on.every(depId => getTask(cwd, depId)?.status === "done");
         if (!allDepsDone) return null;
         return {

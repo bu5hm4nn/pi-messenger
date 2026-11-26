@@ -100,7 +100,12 @@ function nextFeedSeq(cwd: string): number {
   return max + 1;
 }
 
-export function appendFeedEvent(cwd: string, event: FeedEvent): void {
+/**
+ * Append one event. Returns false when the best-effort append was skipped
+ * (e.g. feed-sequence guard timeout), so callers that own transition state can
+ * retry instead of recording an event that never landed.
+ */
+export function appendFeedEvent(cwd: string, event: FeedEvent): boolean {
   const p = feedPath(cwd);
   try {
     const feedDir = path.dirname(p);
@@ -117,16 +122,18 @@ export function appendFeedEvent(cwd: string, event: FeedEvent): void {
     try {
       guard = acquireDirMutex(path.join(feedDir, ".feed-seq"), { timeoutMs: 2000 });
     } catch {
-      return;
+      return false;
     }
     try {
       const sanitized = sanitizeFeedEvent({ ...event, seq: nextFeedSeq(cwd) });
       fs.appendFileSync(p, JSON.stringify(sanitized) + "\n");
+      return true;
     } finally {
       releaseDirMutex(guard);
     }
   } catch {
     // Best effort
+    return false;
   }
 }
 
@@ -311,8 +318,8 @@ export function logFeedEvent(
   type: FeedEventType,
   target?: string,
   preview?: string
-): void {
-  appendFeedEvent(cwd, {
+): boolean {
+  return appendFeedEvent(cwd, {
     ts: new Date().toISOString(),
     agent,
     type,

@@ -120,13 +120,20 @@ describe("Crew idle overlay flash", () => {
 
       const ts = "2026-01-01T00:00:02.000Z";
       appendFeedEvent(cwd, { ts, agent: "crew", type: "task.done", target: "task-1" });
-      appendFeedEvent(cwd, { ts, agent: "crew", type: "crew.idle", preview: "outstanding work" });
 
-      // Second render reads both equal-ts events through the persisted cursor:
-      // the done flash shows and the unseen idle is queued, not suppressed.
+      // Render BETWEEN the two equal-timestamp appends: the first event must
+      // advance the cursor before the second is written.
       overlay.render();
       expect(viewState.notification?.message).toContain("completed");
+
+      appendFeedEvent(cwd, { ts, agent: "crew", type: "crew.idle", preview: "outstanding work" });
+      overlay.render();
+      // The later idle event is not suppressed by its equal timestamp; it
+      // queues behind the still-visible done flash and then actually displays.
       expect(viewState.pendingNotifications.join(" ")).toContain("crew idle");
+      vi.advanceTimersByTime(2001);
+      overlay.render();
+      expect(viewState.notification?.message).toContain("crew idle");
     } finally {
       overlay.dispose();
       vi.useRealTimers();

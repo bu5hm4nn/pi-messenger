@@ -232,11 +232,18 @@ describe("lobby workers", () => {
     const inbox = path.join(inboxDir, worker.name);
     const messageFile = fs.readdirSync(inbox).find(file => file.endsWith(".json"));
     expect(messageFile).toBeTruthy();
-    const message = JSON.parse(fs.readFileSync(path.join(inbox, messageFile!), "utf-8")) as { text: string; dispatchToken?: string };
+    const message = JSON.parse(fs.readFileSync(path.join(inbox, messageFile!), "utf-8")) as {
+      text: string;
+      dispatchToken?: string;
+      taskId?: string;
+      lobbyId?: string;
+    };
     expect(message.text).toContain("Follow the assignment below");
     expect(message.text).not.toContain("reserving files, implementing, testing, committing");
     // Structured, not prompt text: the extension attaches it, not the model.
     expect(message.dispatchToken).toBe("lobby-dispatch-token");
+    expect(message.taskId).toBe("task-3");
+    expect(message.lobbyId).toBe(worker.lobbyId);
     expect(message.text).not.toContain("lobby-dispatch-token");
   });
 
@@ -446,6 +453,30 @@ describe("lobby workers", () => {
     expect(storeModule.appendTaskProgress).not.toHaveBeenCalledWith(
       "/test/cwd", "task-4", "system", expect.stringContaining("Reset to todo"),
     );
+  });
+
+  it("close handler survives a progress-append throw for an accepted exit", async () => {
+    const storeModule = await import("../../crew/store.ts");
+    const worker = lobby.spawnLobbyWorker("/test/cwd")!;
+    worker.assignedTaskId = "task-progress-throw";
+
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({
+      outcome: "todo",
+      task: { id: "task-progress-throw", status: "todo", attempt_count: 1, depends_on: [], created_at: "" } as any,
+      previous: { id: "task-progress-throw", status: "in_progress", attempt_count: 1, depends_on: [], created_at: "", base_commit: "abc1234" } as any,
+    });
+    vi.mocked(storeModule.appendTaskProgress).mockImplementationOnce(() => {
+      throw new Error("progress guard timeout");
+    });
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const proc = worker.proc as any;
+      expect(() => proc._handlers["close"](0)).not.toThrow();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("lobby progress note for task-progress-throw"));
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("close handler survives an exitAttempt lock timeout", async () => {

@@ -42,7 +42,9 @@ export async function executeRevise(
   // that landed while the planner ran.
   const specGeneration = task.generation ?? 0;
 
-  const spec = store.getTaskSpec(cwd, taskId) ?? "";
+  // Spec is read from the generation selected by the same task snapshot, so a
+  // writer cannot hand us a newer spec file with an older generation token.
+  const spec = store.getTaskSpecFor(cwd, task) ?? "";
   const progress = store.getTaskProgress(cwd, taskId) ?? "";
   const blockContext = store.getBlockContext(cwd, taskId) ?? "";
   const prdContent = readPrd(cwd);

@@ -46,10 +46,6 @@ function writeResult(dir: string, suffix: string, data: unknown): void {
   fs.writeFileSync(path.join(dir, `${process.pid}.${suffix}.json`), JSON.stringify(data));
 }
 
-function taskPath(cwd: string, taskId: string): string {
-  return path.join(cwd, ".pi", "messenger", "crew", "tasks", `${taskId}.json`);
-}
-
 const [mode, cwd, taskId, dir, extra] = process.argv.slice(2);
 if (!mode || !cwd || !taskId || !dir) {
   throw new Error("usage: guard-contender.ts <race|reclaim|hold|release> <cwd> <taskId> <dir> [extra]");
@@ -73,11 +69,23 @@ if (mode === "race") {
 } else if (mode === "reclaim") {
   waitFor(path.join(dir, "go"));
 
-  // Observe first, reclaim second: the parent verifies BOTH children saw the
-  // same dead marker before either may unlink it.
-  const markers = fs.readdirSync(store.getTaskGuardPath(cwd, taskId));
-  writeResult(dir, "observed", { markers });
-  waitFor(path.join(dir, "release"));
+  // Observe INSIDE the production liveness probe: both children must see the
+  // same marker at the exact point reclaim decides the holder is dead. The
+  // loser then exercises a genuinely stale production reclaim (its unlink sees
+  // the winner's successor or ENOENT), not a pre-barrier snapshot.
+  let observed = false;
+  store.setGuardLivenessProbe(() => {
+    if (!observed) {
+      observed = true;
+      const markers = fs.readdirSync(store.getTaskGuardPath(cwd, taskId));
+      writeResult(dir, "observed", { markers });
+      waitFor(path.join(dir, "release"));
+      return "dead";
+    }
+    // After the barrier, only the seeded dead marker is reclaimed; a successor
+    // installed by the winner must look alive to the loser.
+    return "alive";
+  });
 
   const reclaimed = store.tryReclaimTaskGuard(cwd, taskId);
   writeResult(dir, "reclaim", { reclaimed });
@@ -112,15 +120,12 @@ if (mode === "race") {
   });
   writeResult(dir, "done", {});
 } else if (mode === "release") {
-  // Release the holder as soon as the watched task file disappears: the
-  // deleting process unlinks that file before it blocks on the dependent's
-  // guard, so this is a filesystem barrier rather than a sleep.
+  // Two-phase handshake: the parent creates `scan` only after the deleter has
+  // actually read the dependent list. Waiting for the target's unlink would
+  // release the holder before the deleter scans, so the test could pass
+  // without ever exercising "dependency added after the snapshot".
   waitFor(path.join(dir, "go"));
-  const deadline = Date.now() + 10000;
-  while (fs.existsSync(taskPath(cwd, taskId))) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${taskPath(cwd, taskId)} to disappear`);
-    sleepSync(2);
-  }
+  waitFor(path.join(dir, "scan"), 10000);
   fs.writeFileSync(path.join(dir, "release"), "");
   writeResult(dir, "released", {});
 } else {

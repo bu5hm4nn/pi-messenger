@@ -217,6 +217,7 @@ export function spawnLobbyWorker(
   });
 
   proc.on("close", (exitCode) => {
+    try {
     const displayId = worker.assignedTaskId ?? taskId;
     removeLiveWorker(cwd, displayId);
     unregisterWorker(cwd, taskId);
@@ -259,8 +260,14 @@ export function spawnLobbyWorker(
           ? "before task.start — work may not have started — verify state before retrying."
           : "before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing.";
         const suffix = exit.outcome === "blocked" ? " Blocked at max attempts." : " Reset to todo.";
-        store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
-          `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) ${wording}${baseRef}${suffix}`);
+        try {
+          store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
+            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) ${wording}${baseRef}${suffix}`);
+        } catch (progressErr) {
+          // A dying worker must never crash the lobby host because another
+          // writer holds the progress append path.
+          console.error(`[pi-messenger] lobby progress note for ${worker.assignedTaskId} failed: ${progressErr instanceof Error ? progressErr.message : progressErr}`);
+        }
         if (exit.outcome === "blocked") {
           logFeedEvent(cwd, worker.name, "task.block", worker.assignedTaskId, `Max attempts reached`);
         } else {
@@ -270,8 +277,12 @@ export function spawnLobbyWorker(
         // Owner/token mismatch: only the rejection reason, never a reset or
         // reconcile note that could be mistaken for this worker's attempt.
         const current = store.getTask(cwd, worker.assignedTaskId);
-        store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
-          `Ignored stale exit from ${worker.name}: task holds a different reservation or completion (status ${current?.status ?? "missing"}); left untouched.`);
+        try {
+          store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
+            `Ignored stale exit from ${worker.name}: task holds a different reservation or completion (status ${current?.status ?? "missing"}); left untouched.`);
+        } catch (progressErr) {
+          console.error(`[pi-messenger] lobby stale-exit note for ${worker.assignedTaskId} failed: ${progressErr instanceof Error ? progressErr.message : progressErr}`);
+        }
       }
     } else {
       logFeedEvent(cwd, worker.name, "leave", undefined, `Lobby worker exited (code ${exitCode ?? "unknown"})`);
@@ -304,14 +315,22 @@ export function spawnLobbyWorker(
           return;
         }
         if (idleActive.get(cwd)) return;
-        idleActive.set(cwd, true);
-        logFeedEvent(cwd, "crew", "crew.idle", undefined,
+        // Mark the transition reported only after the append actually landed.
+        // A feed-lock timeout leaves it unreported so a later close re-emits the
+        // same transition; a successful append gates the re-emit.
+        const reported = logFeedEvent(cwd, "crew", "crew.idle", undefined,
           `All crew workers exited with outstanding work: ${outstanding.map(t => t.id).join(", ")}. Autonomous continuation should resume them; if the session stopped, run pi_messenger({ action: "work", autonomous: true }).`);
+        if (reported) idleActive.set(cwd, true);
       } else {
         idleActive.set(cwd, false);
       }
     } catch (e) {
       console.error(`[pi-messenger] crew.idle detection failed: ${e instanceof Error ? e.message : e}`);
+    }
+    } catch (e) {
+      // The close callback runs in the orchestrator's process and must never
+      // throw: log and leave the reservation for the next recovery pass.
+      console.error(`[pi-messenger] lobby close handler failed: ${e instanceof Error ? e.message : e}`);
     }
   });
 
@@ -362,7 +381,9 @@ ${taskPrompt}`,
     replyTo: null,
     // Structured (not prompt text) so the worker extension can attach the
     // trusted reservation to task.done/block/reset without the model typing it.
-    ...(dispatchToken ? { dispatchToken } : {}),
+    // The task id and lobby instance let the receiver verify the message
+    // against the live reservation and the exact warm worker it was written for.
+    ...(dispatchToken ? { dispatchToken, taskId, lobbyId: worker.lobbyId } : {}),
   };
 
   const random = Math.random().toString(36).substring(2, 8);

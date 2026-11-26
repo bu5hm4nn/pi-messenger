@@ -142,6 +142,7 @@ Follow the output format in your instructions.`;
 
   // Apply updates to task specs
   let updatedCount = 0;
+  let staleCount = 0;
   for (const update of updates) {
     const matchingTask = dependentTasks.find(t => 
       t.id === update.taskId || 
@@ -151,7 +152,7 @@ Follow the output format in your instructions.`;
     if (matchingTask && update.newContent) {
       const current = store.getTask(cwd, matchingTask.id);
       if (!current) continue;
-      const currentSpec = store.getTaskSpec(cwd, matchingTask.id) ?? "";
+      const currentSpec = store.getTaskSpecFor(cwd, current) ?? "";
       
       // Append update to spec (don't replace)
       const updatedSpec = `${currentSpec}
@@ -164,10 +165,17 @@ ${update.newContent}`;
       // The append was computed outside the guard, so it carries the
       // generation it was built from: a newer spec edit makes it stale and
       // aborts instead of overwriting.
-      const applied = store.setTaskSpec(cwd, matchingTask.id, updatedSpec, {
-        expectedGeneration: current.generation ?? 0,
-      });
-      if (applied) updatedCount++;
+      try {
+        const applied = store.setTaskSpec(cwd, matchingTask.id, updatedSpec, {
+          expectedGeneration: current.generation ?? 0,
+        });
+        if (applied) updatedCount++;
+      } catch (err) {
+        // A concurrent revise won this generation: skip the append instead of
+        // overwriting it. Stale is a normal loser outcome, not a sync failure.
+        if (!(err instanceof store.StaleTaskGenerationError)) throw err;
+        staleCount++;
+      }
     }
   }
 
@@ -175,7 +183,7 @@ ${update.newContent}`;
   const text = `# Sync Complete: ${target}
 
 **Dependent tasks checked:** ${dependentTasks.length}
-**Specs updated:** ${updatedCount}
+**Specs updated:** ${updatedCount}${staleCount > 0 ? ` (${staleCount} skipped: concurrent edit)` : ""}
 
 ${updates.length > 0 ? `## Updates\n${updates.map(u => `- **${u.taskId}**: ${u.reason}`).join("\n")}` : "## No Updates Needed\n\nDependent task specs are already up to date."}
 

@@ -153,6 +153,30 @@ describe("crew idle transition detection", () => {
     expect(crewIdleEvents(dirs.cwd)).toHaveLength(0);
   });
 
+  it("leaves an idle transition unreported when the feed append fails, then re-emits", async () => {
+    const feed = await import("../../feed.ts");
+    const worker = spawnLobbyWorker(dirs.cwd)!;
+    worker.assignedTaskId = "task-feed-timeout";
+
+    const storeModule = await import("../../crew/store.ts");
+    vi.spyOn(storeModule, "exitAttempt").mockReturnValue({ outcome: "changed", task: null, previous: null });
+
+    const spy = vi.spyOn(feed, "logFeedEvent");
+    spy.mockReturnValueOnce(false);
+    const proc = worker.proc as unknown as MockProc;
+    proc.exitCode = 0;
+    proc.fire("close", 0);
+
+    // The append was dropped, so the transition was NOT marked reported.
+    expect(crewIdleEvents(dirs.cwd)).toHaveLength(0);
+
+    // A later close re-emits the same transition exactly once (the successful
+    // append gates any further re-emit).
+    proc.fire("close", 0);
+    expect(crewIdleEvents(dirs.cwd)).toHaveLength(1);
+    spy.mockRestore();
+  });
+
   it("reports two distinct idle transitions even inside the old two-second window", () => {
     const first = spawnLobbyWorker(dirs.cwd)!;
     const second = spawnLobbyWorker(dirs.cwd)!;

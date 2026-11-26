@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessengerState } from "../../lib.ts";
 import * as store from "../../crew/store.ts";
 import * as agents from "../../crew/agents.ts";
+import { parseMarkerName } from "../../dir-mutex.ts";
 import { createTempCrewDirs, type TempCrewDirs } from "../helpers/temp-dirs.ts";
 import { createMockContext } from "../helpers/mock-context.ts";
 
@@ -31,6 +32,7 @@ afterEach(() => {
     try { child.kill("SIGKILL"); } catch {}
   }
   store.setGuardLivenessProbe(null);
+  store.setDependentScanProbe(null);
   vi.restoreAllMocks();
 });
 
@@ -326,6 +328,34 @@ describe("task guard reclaim", () => {
   });
 });
 
+describe("marker parser strictness", () => {
+  it("requires the exact host-pid-uuid separator and a canonical pid", () => {
+    const uuid = randomUUID();
+    expect(parseMarkerName(`host-123-${uuid}`)).toEqual({ host: "host", pid: 123 });
+    expect(parseMarkerName(`host-name-123-${uuid}`)).toEqual({ host: "host-name", pid: 123 });
+
+    // The character before the uuid must be '-', not merely skipped.
+    expect(parseMarkerName(`host-123x${uuid}`)).toBeNull();
+    // Noncanonical pids: leading zeroes, sign, exponent, empty.
+    expect(parseMarkerName(`host-0123-${uuid}`)).toBeNull();
+    expect(parseMarkerName(`host-+123-${uuid}`)).toBeNull();
+    expect(parseMarkerName(`host-1e3-${uuid}`)).toBeNull();
+    expect(parseMarkerName(`host--${uuid}`)).toBeNull();
+  });
+
+  it("reclaim refuses a malformed single marker even when its pid would be dead", () => {
+    const dirs = createTempCrewDirs();
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+    const guardPath = store.getTaskGuardPath(dirs.cwd, task.id);
+    const malformed = `${os.hostname()}-${exitedPid()}x${randomUUID()}`;
+    seedGuard(guardPath, malformed);
+
+    expect(store.tryReclaimTaskGuard(dirs.cwd, task.id)).toBe(false);
+    expect(fs.existsSync(path.join(guardPath, malformed))).toBe(true);
+  });
+});
+
 // =============================================================================
 // 5. pre-publish guard check
 // =============================================================================
@@ -604,10 +634,18 @@ describe("dependent list interleave", () => {
     // Wait until the other process holds t2's guard inside its mutation.
     await waitFor(() => resultFiles(gate, "inside").length === 1, "contender to hold the guard");
 
-    // deleteTask snapshots dependents, then blocks on t2's guard. The releaser
-    // watches t1.json disappear (the unlink just before that block) and opens
-    // the release barrier; no fixed sleep decides the ordering.
-    expect(store.deleteTask(dirs.cwd, t1.id)).toBe(true);
+    // deleteTask scans dependents, then blocks on t2's guard. The releaser is
+    // two-phase: it waits for `scan`, which we create only after observing the
+    // deleter's own dependent-list readdir. The holder therefore writes t3
+    // strictly after the deleter snapshot, and the guarded filter must recompute.
+    // The parent writes the scan barrier from deleteTask's own post-snapshot
+    // seam, so the holder is released only after the dependent list was read.
+    store.setDependentScanProbe(() => fs.writeFileSync(path.join(gate, "scan"), ""));
+    try {
+      expect(store.deleteTask(dirs.cwd, t1.id)).toBe(true);
+    } finally {
+      store.setDependentScanProbe(null);
+    }
 
     await Promise.all([waitForExit(holder), waitForExit(releaser)]);
 
@@ -658,6 +696,25 @@ describe("lifecycle mutation guards", () => {
       maxAttempts: 5,
     });
     expect(result.outcome).toBe("changed");
+    expect(store.getTask(dirs.cwd, task.id)?.dispatch_token).toBe(claimed.dispatch_token);
+  });
+
+  it("exitAttempt refusal returns the reason and no prior snapshot", () => {
+    const dirs = createTempCrewDirs();
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+    const claimed = store.claimTaskForDispatch(dirs.cwd, task.id, "WaveA")!;
+    store.startTask(dirs.cwd, task.id, "WaveA", { dispatchToken: claimed.dispatch_token });
+
+    const refused = store.exitAttempt(dirs.cwd, task.id, {
+      owner: "WaveA",
+      dispatchToken: "stale-token",
+      maxAttempts: 5,
+    });
+    expect(refused.outcome).toBe("changed");
+    expect(refused.task).toBeNull();
+    expect(refused.previous).toBeNull();
+    expect(refused.reason).toBe("dispatch_token_mismatch");
     expect(store.getTask(dirs.cwd, task.id)?.dispatch_token).toBe(claimed.dispatch_token);
   });
 

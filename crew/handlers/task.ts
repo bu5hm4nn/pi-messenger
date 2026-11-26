@@ -228,35 +228,22 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
   }
 
   // Accept the parent transition before creating anything: revalidate the
-  // exact instance/lifecycle snapshot under the guard. A claim or completion
-  // that landed since the snapshot is a refusal, never a takeover.
+  // exact instance/lifecycle snapshot under the guard. The task enters a
+  // pending-split state that claims, starts, milestone completion and ready
+  // scans all refuse, so the intermediate parent can never be worked on with
+  // its old dependency list.
   const expectedRev = task.rev ?? 0;
+  let splitGeneration = task.generation ?? 0;
   const accepted = store.mutateTask(cwd, id, current => {
     if (current.id !== id || current.created_at !== task.created_at) return null;
     if ((current.rev ?? 0) !== expectedRev) return null;
     if (current.status !== task.status) return null;
-    if (current.status === "done" || current.milestone) return null;
+    if (current.status === "done" || current.milestone || current.pending_split) return null;
     if ((current.dispatch_token ?? undefined) !== (task.dispatch_token ?? undefined)) return null;
     if ((current.assigned_to ?? undefined) !== (task.assigned_to ?? undefined)) return null;
     if ((current.completed_at ?? undefined) !== (task.completed_at ?? undefined)) return null;
-    return {
-      milestone: true,
-      status: "todo",
-      started_at: undefined,
-      completed_at: undefined,
-      base_commit: undefined,
-      assigned_to: undefined,
-      summary: undefined,
-      evidence: undefined,
-      completed_by: undefined,
-      completed_dispatch: undefined,
-      dispatch_token: undefined,
-      blocked_reason: undefined,
-      role: undefined,
-      risk_labels: undefined,
-      approval: undefined,
-      generation: (current.generation ?? 0) + 1,
-    };
+    splitGeneration = current.generation ?? 0;
+    return { pending_split: true };
   });
   if (!accepted) {
     return result(`Error: Task ${id} changed while splitting (claim, completion or edit landed); no subtasks were created. Re-run task.split.`, {
@@ -264,10 +251,6 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
       error: "task_changed",
       id,
     });
-  }
-
-  if (task.status === "blocked") {
-    store.cleanupBlockFiles(cwd, id);
   }
 
   const created: Task[] = [];
@@ -283,8 +266,75 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
     created.push(newTask);
   }
 
-  const allTasks = store.getTasks(cwd);
   const subtaskIds = created.map(t => t.id);
+
+  // ONE guarded commit publishes the milestone flag and its actual child links
+  // together. Nothing has treated the parent as a milestone before this, and a
+  // concurrent claim/start/edit since acceptance refuses the commit instead of
+  // linking children to an already-worked or already-done parent.
+  const linked = store.mutateTask(cwd, id, current => {
+    if (!current.pending_split) return null;
+    if ((current.rev ?? 0) !== (accepted.rev ?? 0)) return null;
+    if ((current.generation ?? 0) !== splitGeneration) return null;
+    if (current.status === "done" || current.milestone) return null;
+    // A reservation that existed at acceptance is this split's takeover: the
+    // commit clears it. Any reservation added since then bumped rev and was
+    // refused above, so a concurrent wave cannot be stolen from here.
+    return {
+      milestone: true,
+      status: "todo",
+      depends_on: subtaskIds,
+      pending_split: undefined,
+      started_at: undefined,
+      completed_at: undefined,
+      base_commit: undefined,
+      assigned_to: undefined,
+      summary: undefined,
+      evidence: undefined,
+      completed_by: undefined,
+      completed_dispatch: undefined,
+      dispatch_token: undefined,
+      blocked_reason: undefined,
+      role: undefined,
+      risk_labels: undefined,
+      approval: undefined,
+    };
+  });
+  if (!linked) {
+    // Roll the pending-split decision back so the task is not stranded in a
+    // state no worker can claim, and remove subtasks that are still untouched.
+    store.mutateTask(cwd, id, current =>
+      current.pending_split ? { pending_split: undefined } : null
+    );
+    const rolledBack: string[] = [];
+    const kept: string[] = [];
+    for (const sub of created) {
+      if (store.discardUnclaimedTask(cwd, sub.id)) rolledBack.push(sub.id);
+      else kept.push(sub.id);
+    }
+    const keptNote = kept.length > 0
+      ? ` Untouched subtasks were removed; already-claimed subtasks were left in place: ${kept.join(", ")}.`
+      : " Untouched subtasks were removed.";
+    return result(`Error: Task ${id} changed while completing the split; subtasks ${subtaskIds.join(", ")} were created but the parent was not linked (pending split rolled back).${keptNote}`, {
+      mode: "task.split",
+      error: "split_not_committed",
+      id,
+      subtasks: kept.map(subId => {
+        const sub = created.find(t => t.id === subId)!;
+        return { id: sub.id, title: sub.title };
+      }),
+      rolledBackSubtasks: rolledBack,
+    });
+  }
+
+  if (task.status === "blocked") {
+    store.cleanupBlockFiles(cwd, id);
+  }
+
+  // Only after the parent is a fully-linked milestone do dependents move to
+  // the concrete subtasks. A dependent never observes a milestone with its old
+  // (or empty) dependency list.
+  const allTasks = store.getTasks(cwd);
   for (const t of allTasks) {
     if (t.id === id || !t.depends_on.includes(id) || subtaskIds.includes(t.id)) continue;
     // The merge is computed from the dependency list read inside the
@@ -296,23 +346,8 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
     );
   }
 
-  // The parent was accepted above; link the actual subtask ids under the same
-  // guard. A spec edit that landed meanwhile still blocks the spec overwrite
-  // below via the generation precondition.
-  const linked = store.mutateTask(cwd, id, current =>
-    current.milestone ? { depends_on: subtaskIds } : null
-  );
-  if (!linked) {
-    return result(`Error: Task ${id} changed while completing the split; subtasks ${subtaskIds.join(", ")} were created but the parent was not linked.`, {
-      mode: "task.split",
-      error: "split_not_committed",
-      id,
-      subtasks: created.map(t => ({ id: t.id, title: t.title })),
-    });
-  }
-
   const specWritten = store.setTaskSpec(cwd, id, `# ${task.title}\n\nMilestone: completes when ${subtaskIds.join(", ")} are done.\n`, {
-    expectedGeneration: accepted.generation ?? 0,
+    expectedGeneration: linked.generation ?? 0,
   });
 
   logFeedEvent(cwd, state.agentName || "unknown", "task.split", id,

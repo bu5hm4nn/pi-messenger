@@ -105,6 +105,10 @@ export function parseMarkerName(name: string): ParsedMarker | null {
   if (name.length < 36 + 3) return null;
   const uuid = name.slice(-36);
   if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(uuid)) return null;
+  // The character immediately before the fixed-width uuid must be the '-'
+  // separator. Without this check `host-123x<uuid>` would parse as host
+  // "host-123", treating a malformed marker as canonical.
+  if (name.slice(-(36 + 1), -36) !== "-") return null;
   const rest = name.slice(0, -(36 + 1));
   const dash = rest.lastIndexOf("-");
   if (dash <= 0) return null;

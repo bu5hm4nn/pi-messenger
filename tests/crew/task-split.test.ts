@@ -136,6 +136,139 @@ describe("crew/task.split", () => {
     }
   });
 
+  it("pending split prevents milestone auto-completion and work claims before linking", async () => {
+    const parent = store.createTask(cwd, "Parent with no deps", "Parent work");
+    const originalCreate = store.createTask.bind(store);
+    let injected = false;
+    let statusAfterAutoComplete: string | undefined;
+    let claimedDuringSplit: store.Task | null = null;
+    let startedDuringSplit: store.Task | null = null;
+    let response: Awaited<ReturnType<typeof taskHandler.execute>>;
+
+    const spy = vi.spyOn(store, "createTask").mockImplementation(((
+      taskCwd: string,
+      title: string,
+      description?: string,
+      dependsOn?: string[],
+      options?: Parameters<typeof store.createTask>[4],
+    ) => {
+      if (!injected) {
+        injected = true;
+        // Between split acceptance and the milestone-link commit: the parent
+        // must be pending, not an auto-completable milestone with old deps.
+        store.autoCompleteMilestones(taskCwd);
+        statusAfterAutoComplete = store.getTask(taskCwd, parent.id)?.status;
+        claimedDuringSplit = store.claimTaskForDispatch(taskCwd, parent.id, "Racer");
+        startedDuringSplit = store.startTask(taskCwd, parent.id, "Racer");
+      }
+      return originalCreate(taskCwd, title, description, dependsOn, options);
+    }) as typeof store.createTask);
+
+    try {
+      response = await taskHandler.execute(
+        "split",
+        {
+          id: parent.id,
+          subtasks: [{ title: "Slice one" }, { title: "Slice two" }],
+        },
+        createState(),
+        createMockContext(cwd),
+      );
+      expect(response.details.phase).toBe("execute");
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(injected).toBe(true);
+    // Neither operation may treat the intermediate parent as workable.
+    expect(statusAfterAutoComplete).toBe("todo");
+    expect(claimedDuringSplit).toBeNull();
+    expect(startedDuringSplit).toBeNull();
+
+    const reloaded = store.getTask(cwd, parent.id)!;
+    expect(reloaded.milestone).toBe(true);
+    expect(reloaded.status).toBe("todo");
+    expect(reloaded.pending_split).toBeUndefined();
+    expect(reloaded.depends_on).toEqual(
+      response.details.subtasks.map((t: { id: string }) => t.id),
+    );
+  });
+
+  it("rolls back a refused split and removes untouched subtasks", async () => {
+    const parent = store.createTask(cwd, "Parent", "Parent work");
+    const originalCreate = store.createTask.bind(store);
+    let injected = false;
+
+    const spy = vi.spyOn(store, "createTask").mockImplementation(((
+      taskCwd: string,
+      title: string,
+      description?: string,
+      dependsOn?: string[],
+      options?: Parameters<typeof store.createTask>[4],
+    ) => {
+      if (!injected) {
+        injected = true;
+        // A concurrent spec edit lands after split acceptance; the milestone
+        // commit must refuse instead of linking children to a changed parent.
+        store.applyTaskRevision(taskCwd, parent.id, { spec: "concurrent edit" }, {
+          expectedGeneration: 0,
+        });
+      }
+      return originalCreate(taskCwd, title, description, dependsOn, options);
+    }) as typeof store.createTask);
+
+    let response: Awaited<ReturnType<typeof taskHandler.execute>>;
+    try {
+      response = await taskHandler.execute(
+        "split",
+        {
+          id: parent.id,
+          subtasks: [{ title: "Slice one" }, { title: "Slice two" }],
+        },
+        createState(),
+        createMockContext(cwd),
+      );
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(response.details.error).toBe("split_not_committed");
+    const after = store.getTask(cwd, parent.id)!;
+    expect(after.pending_split).toBeUndefined();
+    expect(after.milestone).not.toBe(true);
+    expect(after.depends_on).toEqual([]);
+    // The untouched subtasks from the refused split are rolled back, not left
+    // behind as claimable orphan work.
+    expect(store.getTasks(cwd).map(t => t.id)).toEqual([parent.id]);
+  });
+
+  it("splitting an in-progress task commits and invalidates its old reservation", async () => {
+    const parent = store.createTask(cwd, "Live parent", "Parent work");
+    const started = store.startTask(cwd, parent.id, "WorkerA");
+    const oldToken = started!.dispatch_token;
+
+    const response = await taskHandler.execute(
+      "split",
+      {
+        id: parent.id,
+        subtasks: [{ title: "Slice one" }, { title: "Slice two" }],
+      },
+      createState(),
+      createMockContext(cwd),
+    );
+
+    expect(response.details.phase).toBe("execute");
+    const after = store.getTask(cwd, parent.id)!;
+    expect(after.milestone).toBe(true);
+    expect(after.status).toBe("todo");
+    expect(after.dispatch_token).toBeUndefined();
+    expect(after.assigned_to).toBeUndefined();
+    // The old worker's token cannot complete the now-milestone parent.
+    expect(store.completeTask(cwd, parent.id, "late", undefined, "WorkerA", {
+      dispatchToken: oldToken,
+    })).toBeNull();
+  });
+
   it("rejects splitting a milestone task", async () => {
     const parent = store.createTask(cwd, "Parent task", "Parent work");
     await taskHandler.execute(

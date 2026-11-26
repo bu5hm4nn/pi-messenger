@@ -17,13 +17,38 @@ import * as path from "node:path";
 
 const SEQ_FILE = ".task-seq";
 
-function readCounter(counterPath: string): number {
+/** Strict canonical counter: missing, unreadable or malformed means no value. */
+function readCounter(counterPath: string): number | null {
   try {
-    const value = parseInt(fs.readFileSync(counterPath, "utf-8").trim(), 10);
-    return Number.isSafeInteger(value) && value > 0 ? value : 0;
+    const text = fs.readFileSync(counterPath, "utf-8").trim();
+    if (!/^[1-9][0-9]*$/.test(text)) return null;
+    const value = Number(text);
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
   } catch {
-    return 0;
+    return null;
   }
+}
+
+/**
+ * Highest task id visible in any task artifact, not just task JSON. A deleted
+ * task can leave its spec/progress/block/lock artifacts behind; reusing that
+ * id would resurrect an old instance identity.
+ */
+function scanTaskFloor(tasksDir: string): number {
+  let maxN = 0;
+  const scan = (dir: string): void => {
+    let entries: string[];
+    try { entries = fs.readdirSync(dir); } catch { return; }
+    for (const entry of entries) {
+      const match = entry.match(/^task-([1-9][0-9]*)(?:\.|$)/);
+      if (!match) continue;
+      const n = Number(match[1]);
+      if (Number.isSafeInteger(n) && n > maxN) maxN = n;
+    }
+  };
+  scan(tasksDir);
+  scan(path.join(path.dirname(tasksDir), "blocks"));
+  return maxN;
 }
 
 function writeCounter(counterPath: string, value: number): void {
@@ -47,20 +72,14 @@ export function allocateTaskId(cwd: string): string {
   const tasksDir = path.join(cwd, ".pi", "messenger", "crew", "tasks");
   fs.mkdirSync(tasksDir, { recursive: true });
 
-  let maxN = 0;
-  if (fs.existsSync(tasksDir)) {
-    for (const file of fs.readdirSync(tasksDir)) {
-      const match = file.match(/^task-(\d+)\.json$/);
-      if (match) {
-        const n = parseInt(match[1], 10);
-        if (n > maxN) maxN = n;
-      }
-    }
-  }
+  const maxN = scanTaskFloor(tasksDir);
 
   const counterPath = path.join(tasksDir, SEQ_FILE);
   const maxEver = readCounter(counterPath);
-  const next = Math.max(maxN, maxEver) + 1;
+  // Invalid/unreadable counter data never resets the floor: it is derived from
+  // the ids still visible on disk, then persisted so the next allocation stays
+  // monotonic even after those artifacts are cleaned up.
+  const next = Math.max(maxN, maxEver ?? 0) + 1;
   writeCounter(counterPath, next);
   return `task-${next}`;
 }

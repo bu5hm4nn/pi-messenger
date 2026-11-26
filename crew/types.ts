@@ -79,6 +79,17 @@ export interface Task {
   rev?: number;
   /** Spec generation, bumped on every spec edit (stale-edit precondition). */
   generation?: number;
+  /**
+   * Spec layout version. 0/undefined means the legacy `<id>.md` file; positive
+   * values select `<id>.spec.<version>.md`. The task JSON is the only pointer,
+   * so readers can never combine a newer generation with older content.
+   */
+  spec_version?: number;
+  /**
+   * A split has been accepted but its milestone links are not committed yet.
+   * Claims, starts and milestone auto-completion must refuse this task.
+   */
+  pending_split?: boolean;
 }
 
 export interface ReviewFeedback {

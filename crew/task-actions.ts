@@ -10,6 +10,8 @@ export interface TaskActionOptions {
   isWorkerActive?: (taskId: string) => boolean;
   /** Dispatch reservation carried by a spawned worker (PI_CREW_DISPATCH). */
   dispatchToken?: string;
+  /** Override crew-identity detection (tests); production uses the env vars. */
+  crewIdentity?: boolean;
 }
 
 export interface TaskActionResult {
@@ -31,6 +33,28 @@ export function executeTaskAction(
 ): TaskActionResult {
   const task = store.getTask(cwd, taskId);
   if (!task) return { success: false, error: "not_found", message: `Task ${taskId} not found` };
+
+  // A worker session (cold or warm) has a crew identity. If it presents no
+  // token while the task holds a live reservation, it must not fall back to
+  // the unfenced operator path: that path is reserved for sessions with no
+  // crew identity at all (an explicit human/operator takeover).
+  const hasCrewIdentity = options?.crewIdentity
+    ?? (process.env.PI_CREW_WORKER === "1" || process.env.PI_LOBBY_ID !== undefined);
+  const hasDispatchToken = typeof options?.dispatchToken === "string" && options.dispatchToken.length > 0;
+  const tokenBearing = typeof task.dispatch_token === "string" && task.dispatch_token.length > 0;
+  const TOKEN_GATED_ACTIONS: ReadonlySet<TaskAction> = new Set([
+    "start", "block", "unblock", "reset", "cascade-reset", "stop",
+  ]);
+  if (hasCrewIdentity && !hasDispatchToken && tokenBearing && TOKEN_GATED_ACTIONS.has(action)) {
+    return {
+      success: false,
+      error: "dispatch_token_required",
+      message:
+        `Refusing ${action} on ${taskId}: worker ${agentName} has crew identity but no dispatch token, ` +
+        `while task holds reservation ${task.dispatch_token!.slice(0, 8)}. ` +
+        `A tokenless takeover is reserved for operator sessions with no crew identity.`,
+    };
+  }
 
   switch (action) {
     case "start": {

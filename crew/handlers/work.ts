@@ -149,15 +149,29 @@ export async function execute(
 
   const skills = discoverCrewSkills(cwd);
 
+  // A progress note must never abort a wave: the task guard timeout it reports
+  // is precisely the case where another writer may also be contending the
+  // progress file.
+  const appendProgressSafe = (taskId: string, message: string): void => {
+    try {
+      store.appendTaskProgress(cwd, taskId, "system", message);
+    } catch (err) {
+      console.error(`[pi-messenger] progress note for ${taskId} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
   // Assign tasks to lobby workers first (they're already running and warmed up)
   const prdLabel = store.getPlanLabel(plan);
   const lobbyAssigned = new Set<string>();
   // Per-task launch failures while assigning to warm workers: excluded from
   // the regular spawn queue and reported with the wave's failed receipts.
   const lobbyLaunchFailed = new Set<string>();
+  // Actual launch outcomes, not the input queue: a warm failure still counts
+  // as attempted and is reported in the wave's failed list.
+  const attemptedTaskIds = new Set<string>();
   const lobbyWorkers = getAvailableLobbyWorkers(cwd);
   for (const lobbyWorker of lobbyWorkers) {
-    const task = readyTasks.find(t => !lobbyAssigned.has(t.id));
+    const task = readyTasks.find(t => !lobbyAssigned.has(t.id) && !lobbyLaunchFailed.has(t.id));
     if (!task) break;
 
     // A lobby claim is a dispatch: it reserves the task, charges the attempt
@@ -170,8 +184,9 @@ export async function execute(
       });
     } catch (err) {
       if (err instanceof store.TaskLockTimeoutError) {
-        store.appendTaskProgress(cwd, task.id, "system",
+        appendProgressSafe(task.id,
           `Lobby dispatch claim timed out for ${task.id}: ${err.message}`);
+        attemptedTaskIds.add(task.id);
         lobbyLaunchFailed.add(task.id);
         continue;
       }
@@ -188,28 +203,64 @@ export async function execute(
       started = store.startTask(cwd, task.id, lobbyWorker.name, { baseCommit, dispatchToken });
     } catch (err) {
       if (err instanceof store.TaskLockTimeoutError) {
-        try { store.releaseDispatch(cwd, task.id, dispatchToken); } catch {}
-        store.appendTaskProgress(cwd, task.id, "system",
-          `Lobby dispatch start timed out for ${task.id}: ${err.message}`);
+        attemptedTaskIds.add(task.id);
         lobbyLaunchFailed.add(task.id);
+        let releaseError: unknown;
+        try {
+          store.releaseDispatch(cwd, task.id, dispatchToken);
+        } catch (releaseErr) {
+          releaseError = releaseErr;
+        }
+        if (releaseError instanceof store.TaskLockTimeoutError) {
+          // Double timeout: the reservation is still held by this lobby
+          // identity but no worker ever received it. Leave a visible recovery
+          // instruction instead of a silently stuck task.
+          appendProgressSafe(task.id,
+            `Lobby dispatch start timed out for ${task.id} and the best-effort release also timed out; ` +
+            `task remains claimed by ${lobbyWorker.name} (${dispatchToken.slice(0, 8)}) with no worker. ` +
+            `Stop all crew writers, then retry task.reset ${task.id} or remove the named task guard. ` +
+            `Start error: ${err.message}`);
+        } else {
+          appendProgressSafe(task.id,
+            `Lobby dispatch start timed out for ${task.id}: ${err.message}`);
+        }
         continue;
       }
       throw err;
     }
     if (!started) {
-      store.releaseDispatch(cwd, task.id, dispatchToken);
+      attemptedTaskIds.add(task.id);
+      lobbyLaunchFailed.add(task.id);
+      appendProgressSafe(task.id,
+        `Lobby dispatch start refused for ${task.id} (reservation ${dispatchToken.slice(0, 8)} released); task was not delivered to ${lobbyWorker.name}.`);
+      try {
+        store.releaseDispatch(cwd, task.id, dispatchToken);
+      } catch (err) {
+        appendProgressSafe(task.id,
+          `Best-effort release after refused start for ${task.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
       continue;
     }
     if (!assignTaskToLobbyWorker(lobbyWorker, task.id, prompt, dirs.inbox, dispatchToken)) {
-      store.exitAttempt(cwd, task.id, {
-        owner: lobbyWorker.name,
-        dispatchToken,
-        maxAttempts: config.work.maxAttemptsPerTask,
-      });
+      attemptedTaskIds.add(task.id);
+      lobbyLaunchFailed.add(task.id);
+      appendProgressSafe(task.id,
+        `Lobby delivery to ${lobbyWorker.name} failed for ${task.id}; reservation ${dispatchToken.slice(0, 8)} released.`);
+      try {
+        store.exitAttempt(cwd, task.id, {
+          owner: lobbyWorker.name,
+          dispatchToken,
+          maxAttempts: config.work.maxAttemptsPerTask,
+        });
+      } catch (err) {
+        appendProgressSafe(task.id,
+          `Best-effort release after delivery failure for ${task.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
       continue;
     }
-    store.appendTaskProgress(cwd, task.id, "system", `Assigned to lobby worker ${lobbyWorker.name} (attempt ${claimed.attempt_count})`);
+    appendProgressSafe(task.id, `Assigned to lobby worker ${lobbyWorker.name} (attempt ${claimed.attempt_count})`);
     logFeedEvent(cwd, lobbyWorker.name, "task.start", task.id, task.title);
+    attemptedTaskIds.add(task.id);
     lobbyAssigned.add(task.id);
   }
   cleanupUnassignedAliveFiles(cwd);
@@ -217,6 +268,11 @@ export async function execute(
   // Build prompts for remaining tasks — spawnAgents throttles via autonomousState.concurrency
   const remainingTasks = readyTasks.filter(t => !lobbyAssigned.has(t.id) && !lobbyLaunchFailed.has(t.id));
   const teamRoles = teamStore.resolveRoles(cwd);
+  for (const task of remainingTasks) attemptedTaskIds.add(task.id);
+  // Preserve plan order while reflecting actual launch outcomes.
+  const attemptedTaskIdsList = readyTasks
+    .filter(t => attemptedTaskIds.has(t.id))
+    .map(t => t.id);
   const workerTasks = remainingTasks.map(task => {
     const roleName = teamStore.resolveRoleName(cwd, task.role);
     const roleModel = roleName ? teamRoles[roleName]?.model : undefined;
@@ -300,23 +356,31 @@ export async function execute(
       `Worker exited before task.done (status was ${task?.status ?? "unknown"}) — indeterminate: work may have landed. Re-attempt must FIRST reconcile: run git log/diff against the task base commit and review/reuse any landed work before re-implementing.${baseRef} ${why}`);
   };
 
-  // A worker that exited before task.start: the task was never claimed, so
-  // nothing was expected to land — but a protocol-violating worker can still
-  // have edited files, so keep a distinct note that says work may not have
-  // started rather than telling the retry to reconcile landed work.
-  const appendNeverStartedNote = (taskId: string, task: { base_commit?: string } | undefined, why: string) => {
-    const baseRef = task?.base_commit ? ` Prior attempt base commit: ${task.base_commit}.` : "";
-    store.appendTaskProgress(cwd, taskId, "system",
-      `Worker exited before task.start — work may not have started — verify state before retrying.${baseRef} ${why}`);
-  };
-
-  const noteStateChanged = (taskId: string, owner: string | undefined) => {
+  const noteStateChanged = (taskId: string, owner: string | undefined, reason?: string) => {
     const current = store.getTask(cwd, taskId);
     store.appendTaskProgress(cwd, taskId, "system",
-      `Ignored result from ${owner ?? "unknown worker"}: task state changed while processing (now ${current?.status ?? "missing"}${current?.assigned_to ? `, assigned to ${current.assigned_to}` : ""}); left untouched.`);
+      `Ignored result from ${owner ?? "unknown worker"}: task state changed while processing (now ${current?.status ?? "missing"}${current?.assigned_to ? `, assigned to ${current.assigned_to}` : ""}${reason ? `, ${reason}` : ""}); left untouched.`);
   };
 
-  type ResetOutcome = "blocked" | "todo" | "missing" | "changed";
+  // Notes are written only after the guarded exit accepted this attempt, from
+  // the validated prior-attempt snapshot it returned. A refusal returns no
+  // previous snapshot, so a late mismatch can never produce a misleading
+  // reconcile note for work this receipt did not own.
+  const appendExitReconcileNote = (
+    taskId: string,
+    previous: Task | null,
+    why: string,
+  ): void => {
+    if (!previous) return;
+    const baseRef = previous.base_commit ? ` Prior attempt base commit: ${previous.base_commit}.` : "";
+    if (previous.status === "todo") {
+      store.appendTaskProgress(cwd, taskId, "system",
+        `Worker exited before task.start — work may not have started — verify state before retrying.${baseRef} ${why}`);
+    } else {
+      store.appendTaskProgress(cwd, taskId, "system",
+        `Worker exited before task.done (status was ${previous.status}) — indeterminate: work may have landed. Re-attempt must FIRST reconcile: run git log/diff against the task base commit and review/reuse any landed work before re-implementing.${baseRef} ${why}`);
+    }
+  };
 
   // Release a task whose worker exited without finishing. The attempt was
   // already charged by the dispatch claim, so the shared guarded exit only
@@ -327,7 +391,7 @@ export async function execute(
     taskId: string,
     owner: string | undefined,
     dispatchToken: string | undefined,
-  ): ResetOutcome => {
+  ): store.ExitAttemptResult => {
     const result = store.exitAttempt(cwd, taskId, {
       owner,
       dispatchToken,
@@ -336,7 +400,7 @@ export async function execute(
     if (result.outcome === "blocked") {
       logFeedEvent(cwd, "crew", "task.block", taskId, "Max attempts reached after worker exit");
     }
-    return result.outcome;
+    return result;
   };
 
   for (let i = 0; i < workerResults.length; i++) {
@@ -346,7 +410,8 @@ export async function execute(
       failed.push(`unknown-result-${i}`);
       continue;
     }
-    const task = store.getTask(cwd, taskId);
+    try {
+      const task = store.getTask(cwd, taskId);
 
     // Skipped dispatch: the launch-point claim found the task already claimed
     // by another process. It must not be reported as this wave's failure.
@@ -412,28 +477,24 @@ export async function execute(
       } else if (task?.status === "blocked") {
         blocked.push(taskId);
       } else if (task?.status === "in_progress") {
-        // Record the reconciliation note for every owned unfinished receipt,
-        // including the final allowed attempt that is about to be blocked.
-        appendIndeterminateNote(taskId, task,
-          r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
-        const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
-        if (outcome === "blocked") {
-          blocked.push(taskId);
-        } else if (outcome === "todo") {
-          indeterminate.push(taskId);
-        } else if (outcome === "changed") {
-          noteStateChanged(taskId, receiptOwner);
+        const exit = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
+        if (exit.outcome === "blocked" || exit.outcome === "todo") {
+          appendExitReconcileNote(taskId, exit.previous,
+            r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
+          if (exit.outcome === "blocked") blocked.push(taskId);
+          else indeterminate.push(taskId);
+        } else if (exit.outcome === "changed") {
+          noteStateChanged(taskId, receiptOwner, exit.reason);
         }
       } else if (task?.status === "todo") {
-        appendNeverStartedNote(taskId, task,
-          r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
-        const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
-        if (outcome === "blocked") {
-          blocked.push(taskId);
-        } else if (outcome === "todo") {
-          indeterminate.push(taskId);
-        } else if (outcome === "changed") {
-          noteStateChanged(taskId, receiptOwner);
+        const exit = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
+        if (exit.outcome === "blocked" || exit.outcome === "todo") {
+          appendExitReconcileNote(taskId, exit.previous,
+            r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
+          if (exit.outcome === "blocked") blocked.push(taskId);
+          else indeterminate.push(taskId);
+        } else if (exit.outcome === "changed") {
+          noteStateChanged(taskId, receiptOwner, exit.reason);
         }
       } else {
         failed.push(taskId);
@@ -446,76 +507,95 @@ export async function execute(
         } else if (task?.status === "blocked") {
           blocked.push(taskId);
         } else if (task?.status === "in_progress") {
-          appendIndeterminateNote(taskId, task, "Graceful shutdown.");
-          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
-          if (outcome === "blocked") {
-            blocked.push(taskId);
-          } else if (outcome === "todo") {
-            indeterminate.push(taskId);
-          } else if (outcome === "changed") {
-            noteStateChanged(taskId, receiptOwner);
+          const exit = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
+          if (exit.outcome === "blocked" || exit.outcome === "todo") {
+            appendExitReconcileNote(taskId, exit.previous, "Graceful shutdown.");
+            if (exit.outcome === "blocked") blocked.push(taskId);
+            else indeterminate.push(taskId);
+          } else if (exit.outcome === "changed") {
+            noteStateChanged(taskId, receiptOwner, exit.reason);
           }
         } else if (task?.status === "todo") {
-          appendNeverStartedNote(taskId, task, "Graceful shutdown.");
-          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
-          if (outcome === "blocked") {
-            blocked.push(taskId);
-          } else if (outcome === "todo") {
-            indeterminate.push(taskId);
-          } else if (outcome === "changed") {
-            noteStateChanged(taskId, receiptOwner);
+          const exit = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
+          if (exit.outcome === "blocked" || exit.outcome === "todo") {
+            appendExitReconcileNote(taskId, exit.previous, "Graceful shutdown.");
+            if (exit.outcome === "blocked") blocked.push(taskId);
+            else indeterminate.push(taskId);
+          } else if (exit.outcome === "changed") {
+            noteStateChanged(taskId, receiptOwner, exit.reason);
           }
         } else {
           failed.push(taskId);
         }
       } else if (autonomous && task?.status === "in_progress") {
-        store.appendTaskProgress(cwd, taskId, "system", `Worker crashed: ${r.error ?? "Unknown error"}`);
-        // The task is blocked, but the worker may still have landed work.
-        appendIndeterminateNote(taskId, task, `Worker crashed: ${r.error ?? "Unknown error"}`);
         const blockedTask = store.blockTask(cwd, taskId, `Worker failed: ${r.error ?? "Unknown error"}`, {
           owner: receiptOwner,
           dispatchToken: receiptToken,
         });
-        // Report blocked only for the fenced write that actually committed.
-        if (blockedTask) blocked.push(taskId);
-        else noteStateChanged(taskId, receiptOwner);
+        // Report blocked and record the crash anchor only for the fenced write
+        // that actually committed; a refusal must leave the newer attempt's
+        // task and progress untouched.
+        if (blockedTask) {
+          store.appendTaskProgress(cwd, taskId, "system", `Worker crashed: ${r.error ?? "Unknown error"}`);
+          appendIndeterminateNote(taskId, blockedTask, `Worker crashed: ${r.error ?? "Unknown error"}`);
+          blocked.push(taskId);
+        } else {
+          noteStateChanged(taskId, receiptOwner, "crash block refused");
+        }
       } else {
         if (task?.status === "in_progress") {
-          store.appendTaskProgress(cwd, taskId, "system", `Worker failed: ${r.error ?? "Unknown error"}`);
-          // Record the note before the reset/block branch: on the final allowed
-          // attempt the task is blocked, and the reader most needs the anchor.
-          appendIndeterminateNote(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
           // Non-autonomous: previously left stuck in_progress forever; reset so
-          // the next wave can retry (or block at max attempts).
-          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
-          if (outcome === "blocked") {
+          // the next wave can retry (or block at max attempts). The reconcile
+          // note uses only the snapshot the guarded exit validated.
+          const exit = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
+          if (exit.outcome === "blocked" || exit.outcome === "todo") {
+            store.appendTaskProgress(cwd, taskId, "system", `Worker failed: ${r.error ?? "Unknown error"}`);
+            appendExitReconcileNote(taskId, exit.previous, `Worker failed: ${r.error ?? "Unknown error"}`);
+          }
+          if (exit.outcome === "blocked") {
             blocked.push(taskId);
             continue;
           }
-          if (outcome === "changed") {
-            noteStateChanged(taskId, receiptOwner);
+          if (exit.outcome === "changed") {
+            noteStateChanged(taskId, receiptOwner, exit.reason);
             continue;
           }
-          if (outcome === "missing") continue;
+          if (exit.outcome === "missing") continue;
         } else if (task?.status === "todo") {
           // Worker crashed before claiming the task. Consume an attempt here
           // too — otherwise a crash-looping worker is bounded only by maxWaves,
-          // never by maxAttemptsPerTask. Record the distinct never-started
-          // wording even when this attempt exhausts the budget.
-          appendNeverStartedNote(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
-          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
-          if (outcome === "blocked") {
+          // never by maxAttemptsPerTask. The validated snapshot selects the
+          // never-started wording even when this attempt exhausts the budget.
+          const exit = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
+          if (exit.outcome === "blocked" || exit.outcome === "todo") {
+            store.appendTaskProgress(cwd, taskId, "system", `Worker failed: ${r.error ?? "Unknown error"}`);
+            appendExitReconcileNote(taskId, exit.previous, `Worker failed: ${r.error ?? "Unknown error"}`);
+          }
+          if (exit.outcome === "blocked") {
             blocked.push(taskId);
             continue;
           }
-          if (outcome === "changed") {
-            noteStateChanged(taskId, receiptOwner);
+          if (exit.outcome === "changed") {
+            noteStateChanged(taskId, receiptOwner, exit.reason);
             continue;
           }
-          if (outcome === "missing") continue;
+          if (exit.outcome === "missing") continue;
         }
         failed.push(taskId);
       }
+    }
+    } catch (err) {
+      // One contended receipt must never abort the rest of the batch. Log the
+      // typed guard failure (with its recovery text), mark only this receipt's
+      // task failed, and continue draining.
+      const message = err instanceof Error ? err.message : String(err);
+      const typed = err instanceof store.TaskLockTimeoutError
+        ? "task guard timeout"
+        : "unexpected receipt failure";
+      appendProgressSafe(taskId, `Receipt processing failed for ${taskId} (${typed}): ${message}`);
+      console.error(`[pi-messenger] receipt processing for ${taskId} failed (${typed}): ${message}`);
+      failed.push(taskId);
+      continue;
     }
   }
 
@@ -615,7 +695,7 @@ export async function execute(
   if (autonomous) {
     addWaveResult({
       waveNumber: currentWave,
-      tasksAttempted: remainingTasks.map(t => t.id),
+      tasksAttempted: attemptedTaskIdsList,
       succeeded,
       failed,
       indeterminate,
@@ -698,7 +778,7 @@ export async function execute(
   const text = `# Work Wave ${currentWave}
 
 **PRD:** ${store.getPlanLabel(plan)}
-**Tasks attempted:** ${remainingTasks.length}${lobbyAssigned.size > 0 ? ` (+${lobbyAssigned.size} lobby)` : ""}
+**Tasks attempted:** ${attemptedTaskIdsList.length}${lobbyAssigned.size > 0 ? ` (+${lobbyAssigned.size} lobby)` : ""}
 **Progress:** ${progress}
 ${statusText}${lobbyText}${rejectedTasksText(finalRejected)}${nextText}
 
@@ -708,7 +788,7 @@ ${continueText}`;
     mode: "work",
     prd: plan.prd,
     wave: currentWave,
-    attempted: remainingTasks.map(t => t.id),
+    attempted: attemptedTaskIdsList,
     succeeded,
     failed,
     indeterminate,

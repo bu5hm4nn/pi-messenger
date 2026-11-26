@@ -77,9 +77,10 @@ export async function execute(
       rejected.push(task);
     } else if (teamStore.taskPendingApproval(task)) {
       needsApproval.push(task);
-    } else if (task.attempt_count >= config.work.maxAttemptsPerTask) {
+    } else if (store.attemptsSinceReset(task) >= config.work.maxAttemptsPerTask) {
       // Re-check under the guard: a reservation acquired between the ready-task
-      // snapshot and this write must survive instead of being clobbered.
+      // snapshot and this write must survive instead of being clobbered. The
+      // fence is compared against attempts since the last explicit reset.
       const blocked = store.blockTask(cwd, task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`, {
         expectedStatus: "todo",
         requireNoDispatchToken: true,

@@ -68,7 +68,14 @@ export interface Task {
   evidence?: TaskEvidence;       // Evidence from task.done
   completed_by?: string;         // Worker identity that called task.done
   blocked_reason?: string;       // Reason from task.block
-  attempt_count: number;         // How many times attempted (for auto-block)
+  attempt_count: number;         // Lifetime attempts (audit/completion import; never reset)
+  /**
+   * Lifetime attempt_count observed when an explicit task reset last renewed
+   * the retry budget. Attempts since that reset = attempt_count - baseline.
+   * Absent on legacy records, which keeps their original lifetime accounting.
+   * Only explicit reset/cascade-reset write it; automatic recoveries never do.
+   */
+  budget_baseline?: number;
   review_count?: number;         // How many times reviewed
   last_review?: ReviewFeedback;  // Feedback from last review (for retry)
   /** Live dispatch reservation. Present only while a claim is outstanding. */

@@ -582,6 +582,7 @@ function normalizeTask(raw: Task): Task {
     risk_labels: normalizeRiskLabels(Array.isArray(raw.risk_labels) ? raw.risk_labels.filter(s => typeof s === "string") : undefined),
     approval,
     attempt_count: typeof raw.attempt_count === "number" ? raw.attempt_count : 0,
+    budget_baseline: typeof raw.budget_baseline === "number" ? raw.budget_baseline : undefined,
     dispatch_token: typeof raw.dispatch_token === "string" ? raw.dispatch_token : undefined,
     completed_dispatch: typeof raw.completed_dispatch === "string" ? raw.completed_dispatch : undefined,
     rev: typeof raw.rev === "number" ? raw.rev : 0,
@@ -606,6 +607,7 @@ const LIFECYCLE_FIELDS = [
   "assigned_to",
   "dispatch_token",
   "attempt_count",
+  "budget_baseline",
   "completed_by",
   "completed_dispatch",
   "pending_split",
@@ -847,16 +849,27 @@ export function getBaseCommit(cwd: string): string | undefined {
 }
 
 export interface ClaimOptions {
-  /** Refuse the claim at/above this many attempts (cap re-checked here). */
+  /** Refuse the claim at/above this many attempts since the last explicit reset. */
   maxAttempts?: number;
+}
+
+/**
+ * Retry budget consumed since the last explicit reset. `attempt_count` is the
+ * lifetime number (audit/completion import); `budget_baseline` is the lifetime
+ * value observed at that reset. Legacy records have no baseline and therefore
+ * keep their original lifetime accounting (baseline 0).
+ */
+export function attemptsSinceReset(task: Task): number {
+  return (task.attempt_count ?? 0) - (task.budget_baseline ?? 0);
 }
 
 /**
  * Reserve a todo task for one dispatch. The reservation is the dispatch
  * token; the attempt is charged exactly here, once per dispatch, so a worker
- * that never reaches task.start still consumed its budget. This claim-time
- * charging contract is adjudicated and stands: exitAttempt never re-charges
- * and an explicit reset does not silently renew the budget.
+ * that never reaches task.start still consumed its budget. The budget is
+ * counted since the task's last explicit reset; automatic recoveries and
+ * exits never advance the baseline. An explicit reset is the only thing that
+ * renews it (through task-actions, never through resetTask by default).
  */
 export function claimTaskForDispatch(
   cwd: string,
@@ -870,7 +883,7 @@ export function claimTaskForDispatch(
     if (task.pending_split) return null;
     if (task.dispatch_token) return null;
     const attemptCount = task.attempt_count ?? 0;
-    if (attemptCount >= maxAttempts) return null;
+    if (attemptsSinceReset(task) >= maxAttempts) return null;
     return {
       dispatch_token: randomUUID(),
       assigned_to: workerName,
@@ -1001,7 +1014,7 @@ export interface BlockOptions extends LifecycleFence {
   expectedStatus?: TaskStatus;
   /** Only block a task that has no live dispatch reservation. */
   requireNoDispatchToken?: boolean;
-  /** Only block at/above this attempt count (auto-block re-check). */
+  /** Only block at/above this many attempts since the last explicit reset. */
   minAttemptCount?: number;
   /** For a done task: only block while this completion still owns it. */
   completedDispatch?: string;
@@ -1017,7 +1030,7 @@ export function blockTask(
   const updated = mutateTask(cwd, taskId, task => {
     if (fence?.expectedStatus !== undefined && task.status !== fence.expectedStatus) return null;
     if (fence?.requireNoDispatchToken && task.dispatch_token !== undefined) return null;
-    if (fence?.minAttemptCount !== undefined && (task.attempt_count ?? 0) < fence.minAttemptCount) return null;
+    if (fence?.minAttemptCount !== undefined && attemptsSinceReset(task) < fence.minAttemptCount) return null;
     if (fence?.completedDispatch !== undefined && task.completed_dispatch !== fence.completedDispatch) return null;
     if (fence?.completedBy !== undefined && task.completed_by !== fence.completedBy) return null;
     if (fence?.dispatchToken !== undefined && task.dispatch_token !== fence.dispatchToken) return null;
@@ -1053,7 +1066,9 @@ const REOPEN_CLEARS: Partial<Task> = {
 
 /**
  * blocked -> todo (explicit takeover). Reopening invalidates the active
- * dispatch token and the completion attribution.
+ * dispatch token and the completion attribution. Unlike an explicit reset,
+ * unblock does NOT renew the retry budget: it is not a reset, so the
+ * since-reset attempt count (and any baseline) is left untouched.
  */
 export function unblockTask(cwd: string, taskId: string, fence?: LifecycleFence): Task | null {
   const updated = mutateTask(cwd, taskId, task => {
@@ -1079,6 +1094,13 @@ export interface ResetLifecycleSnapshot {
 
 export interface ResetTaskOptions extends LifecycleFence {
   expectedStatus?: TaskStatus;
+  /**
+   * Renew the retry budget: record the current lifetime attempt_count as the
+   * new budget baseline. Only the explicit reset/cascade-reset entry points
+   * in task-actions pass this; automatic resets (review bounce, crash/exit
+   * recovery, revise/split takeover, task.stop) must leave it unset.
+   */
+  renewBudget?: boolean;
   /**
    * Revalidate the lifecycle state captured before a planning pass. Spec edits
    * may have bumped generation/rev since then, but a claim or completion must
@@ -1115,7 +1137,10 @@ export function resetTask(
     return {
       status: "todo",
       ...REOPEN_CLEARS,
-      // Keep attempt_count for tracking
+      // Lifetime attempt_count is kept for audit/completion import. An
+      // explicit reset renews only the retry budget by advancing the baseline
+      // to that lifetime value; the count itself never decreases.
+      ...(options?.renewBudget ? { budget_baseline: task.attempt_count ?? 0 } : {}),
     };
   });
   if (!updated) return resetTasks;
@@ -1128,7 +1153,7 @@ export function resetTask(
     const allTasks = getTasks(cwd);
     for (const t of allTasks) {
       if (t.depends_on.includes(taskId) && t.status !== "todo") {
-        const cascaded = resetTask(cwd, t.id, true);
+        const cascaded = resetTask(cwd, t.id, true, { renewBudget: options?.renewBudget });
         resetTasks.push(...cascaded);
       }
     }
@@ -1209,7 +1234,7 @@ export function exitAttempt(cwd: string, taskId: string, options: ExitAttemptOpt
     // All fences passed: this is the snapshot the caller may use for notes.
     previous = task;
     const maxAttempts = options.maxAttempts ?? Number.POSITIVE_INFINITY;
-    if ((task.attempt_count ?? 0) >= maxAttempts) {
+    if (attemptsSinceReset(task) >= maxAttempts) {
       outcome = "blocked";
       return {
         status: "blocked",

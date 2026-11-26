@@ -257,6 +257,8 @@ export async function executeReviseTree(
         dispatchToken: task.dispatch_token,
         completedAt: task.completed_at,
         completedDispatch: task.completed_dispatch,
+        attemptCount: task.attempt_count,
+        budgetBaseline: task.budget_baseline,
       },
     });
     if (reset.length === 0) {

@@ -98,7 +98,7 @@ Crew logs are per project, under that project's working directory: `.pi/messenge
 ### Workflow
 
 1. **Plan** — Planner explores the codebase and PRD, drafts tasks with dependencies. A reviewer checks the plan; the planner refines until SHIP or `maxPasses` is reached. History is stored in `planning-progress.md`.
-2. **Work** — Workers implement ready tasks (all dependencies met) in parallel waves. A single `work` call runs one wave. `autonomous: true` runs waves back-to-back until everything is done or blocked. Each completed task gets an automatic reviewer pass — SHIP keeps it done, NEEDS_WORK resets it for retry with feedback, MAJOR_RETHINK blocks it. Controlled by `review.enabled` and `review.maxIterations`.
+2. **Work** — Workers implement ready tasks (all dependencies met) in parallel waves. A single `work` call runs one wave. `autonomous: true` runs waves back-to-back until everything is done or blocked. Each completed task gets an automatic reviewer pass — SHIP keeps it done, NEEDS_WORK resets it for retry with feedback without renewing its retry budget, MAJOR_RETHINK blocks it. Controlled by `review.enabled` and `review.maxIterations`.
 3. **Review** — Manual review of a specific task or the plan: `pi_messenger({ action: "review", target: "task-1" })`. Returns SHIP, NEEDS_WORK, or MAJOR_RETHINK with detailed feedback.
 
 No special PRD format required — the planner auto-discovers `PRD.md`, `SPEC.md`, `DESIGN.md`, etc. in your project root and `docs/`. Or skip the file entirely:
@@ -125,6 +125,10 @@ Wave 3:  task-5 (→ task-2, task-4) ── both deps done
 ```
 
 The planner structures tasks to maximize parallelism. Foundation work has no dependencies and starts immediately. Features that don't touch each other get separate chains. Autonomous mode stops when all tasks are done or blocked.
+
+### Retry Budget
+
+`work.maxAttemptsPerTask` is a **per-explicit-reset** budget: it counts attempts since the task's last `task.reset`, not its lifetime attempt count. At the cap the task is auto-blocked. Only an explicit `task.reset` (with `cascade: true` for dependents) renews the budget. Automatic resets (review NEEDS_WORK bounces, crash and worker-exit recovery) and `task.unblock` never renew it. After a cap block, use `task.reset` to grant a fresh budget; unblocking alone leaves the old budget in place and the task will simply block again on the next wave.
 
 ### Crew Skills
 
@@ -280,7 +284,7 @@ Full config reference (all fields optional — only set what you want to change)
 | `review.enabled` | Auto-review after task completion | `true` |
 | `review.maxIterations` | Max review/fix cycles per task | `3` |
 | `planning.maxPasses` | Max planner/reviewer refinement passes | `1` |
-| `work.maxAttemptsPerTask` | Auto-block after N failures | `5` |
+| `work.maxAttemptsPerTask` | Max attempts per explicit-reset budget before auto-blocking | `5` |
 | `work.maxWaves` | Max autonomous waves | `50` |
 | `work.shutdownGracePeriodMs` | Grace period before SIGTERM on abort | `30000` |
 | `work.env` | Environment variables passed to spawned workers | `{}` |
@@ -336,7 +340,7 @@ Agent definitions live in `crew/agents/` within the extension. To customize one 
 | `task.block` | Block a task (`id` + `reason` required) |
 | `task.unblock` | Unblock a task (`id` required) |
 | `task.ready` | List tasks ready to work |
-| `task.reset` | Reset a task (`id` required, `cascade` optional) |
+| `task.reset` | Reset a task and renew its retry budget (`id` required, `cascade` optional) |
 | `crew.status` | Overall crew status |
 | `crew.validate` | Validate plan dependencies |
 | `crew.agents` | List available crew agents |

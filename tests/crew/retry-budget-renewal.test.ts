@@ -57,6 +57,33 @@ function seedAttempts(cwd: string, taskId: string, attempts: number, baseline?: 
   }));
 }
 
+/** Run an explicit cascade reset, invoking `interleave` just before the root reset. */
+function cascadeResetWithInterleave(
+  cwd: string,
+  rootId: string,
+  interleave: () => void,
+): ReturnType<typeof executeTaskAction> {
+  const originalReset = store.resetTask.bind(store);
+  let interleaved = false;
+  const resetSpy = vi.spyOn(store, "resetTask").mockImplementation(((
+    taskCwd: string,
+    taskId: string,
+    cascade?: boolean,
+    options?: Parameters<typeof store.resetTask>[3],
+  ) => {
+    if (!interleaved && taskId === rootId) {
+      interleaved = true;
+      interleave();
+    }
+    return originalReset(taskCwd, taskId, cascade, options);
+  }) as typeof store.resetTask);
+  try {
+    return executeTaskAction(cwd, "cascade-reset", rootId, "Operator");
+  } finally {
+    resetSpy.mockRestore();
+  }
+}
+
 describe("crew/retry budget renewal", () => {
   let dirs: TempCrewDirs;
   let cwd: string;
@@ -255,6 +282,295 @@ describe("crew/retry budget renewal", () => {
     expect(exit.task && store.attemptsSinceReset(exit.task)).toBe(1);
   });
 
+  it("clamps and repairs a corrupted baseline above the lifetime attempt count", () => {
+    const task = store.createTask(cwd, "Corrupted budget", "Desc");
+    seedAttempts(cwd, task.id, 3, 9); // raw corruption: baseline > lifetime
+    const taskPath = path.join(cwd, ".pi", "messenger", "crew", "tasks", `${task.id}.json`);
+    expect(JSON.parse(fs.readFileSync(taskPath, "utf-8")).budget_baseline).toBe(9);
+
+    // The read guard bounds even a raw snapshot: no negative budget can fail
+    // open the cap comparisons.
+    const rawSnapshot = { ...store.getTask(cwd, task.id)!, attempt_count: 3, budget_baseline: 9 };
+    expect(store.attemptsSinceReset(rawSnapshot)).toBe(0);
+
+    // Hydration repairs the out-of-range baseline to the lifetime count
+    // (fresh-budget-equivalent, since-reset 0).
+    const hydrated = store.getTask(cwd, task.id)!;
+    expect(hydrated.budget_baseline).toBe(3);
+    expect(store.attemptsSinceReset(hydrated)).toBe(0);
+
+    // The next guarded mutation persists the bounded record instead of
+    // writing the corruption forward.
+    const updated = store.updateTask(cwd, task.id, { title: "Corrupted budget (repaired)" });
+    expect(updated?.budget_baseline).toBe(3);
+    expect(JSON.parse(fs.readFileSync(taskPath, "utf-8"))).toMatchObject({
+      attempt_count: 3,
+      budget_baseline: 3,
+    });
+  });
+
+  it("cascade-reset skips a dependent claimed after the subtree snapshot", () => {
+    const root = store.createTask(cwd, "Root", "Desc");
+    const claimedChild = store.createTask(cwd, "Claimed child", "Desc", [root.id]);
+    const unclaimedChild = store.createTask(cwd, "Unclaimed child", "Desc", [root.id]);
+
+    // Snapshot-visible states: the root and one dependent are done; the other
+    // dependent is blocked and will be reopened and claimed mid-cascade.
+    store.mutateTask(cwd, root.id, () => ({ status: "done", attempt_count: 2 }));
+    store.mutateTask(cwd, claimedChild.id, () => ({
+      status: "blocked",
+      attempt_count: 3,
+      blocked_reason: "earlier failure",
+    }));
+    store.mutateTask(cwd, unclaimedChild.id, () => ({ status: "done", attempt_count: 4 }));
+
+    const originalReset = store.resetTask.bind(store);
+    let interleaved = false;
+    const resetSpy = vi.spyOn(store, "resetTask").mockImplementation(((
+      taskCwd: string,
+      taskId: string,
+      cascade?: boolean,
+      options?: Parameters<typeof store.resetTask>[3],
+    ) => {
+      if (!interleaved && taskId === root.id) {
+        interleaved = true;
+        // Another writer reopens the dependent and dispatches it after the
+        // cascade snapshot but before the dependent reset pass.
+        store.unblockTask(taskCwd, claimedChild.id);
+        const reservation = store.claimTaskForDispatch(taskCwd, claimedChild.id, "LateWorker", { maxAttempts: CAP });
+        expect(reservation).not.toBeNull();
+        expect(store.startTask(taskCwd, claimedChild.id, "LateWorker", {
+          dispatchToken: reservation!.dispatch_token,
+        })?.status).toBe("in_progress");
+      }
+      return originalReset(taskCwd, taskId, cascade, options);
+    }) as typeof store.resetTask);
+
+    try {
+      const result = executeTaskAction(cwd, "cascade-reset", root.id, "Operator");
+      expect(result.success).toBe(true);
+    } finally {
+      resetSpy.mockRestore();
+    }
+
+    const rootAfter = store.getTask(cwd, root.id)!;
+    expect(rootAfter.status).toBe("todo");
+    expect(rootAfter.budget_baseline).toBe(2);
+
+    // The claimed dependent is not clobbered, not renewed, and says why.
+    const claimedAfter = store.getTask(cwd, claimedChild.id)!;
+    expect(claimedAfter.status).toBe("in_progress");
+    expect(claimedAfter.assigned_to).toBe("LateWorker");
+    expect(claimedAfter.dispatch_token).toBeTruthy();
+    expect(claimedAfter.budget_baseline).toBeUndefined();
+    expect(store.attemptsSinceReset(claimedAfter)).toBe(4); // lifetime accounting, no reset renewal
+    const progress = store.getTaskProgress(cwd, claimedChild.id) ?? "";
+    expect(progress).toContain(`Cascade reset skipped ${claimedChild.id}`);
+    expect(progress).toContain("active dispatch reservation");
+    expect(progress).toContain("left untouched");
+
+    // An unclaimed dependent still resets and renews its own budget.
+    const unclaimedAfter = store.getTask(cwd, unclaimedChild.id)!;
+    expect(unclaimedAfter.status).toBe("todo");
+    expect(unclaimedAfter.attempt_count).toBe(4);
+    expect(unclaimedAfter.budget_baseline).toBe(4);
+    expect(store.attemptsSinceReset(unclaimedAfter)).toBe(0);
+  });
+
+  it("cascade fence skips a dependent whose attempt state changed after the snapshot", () => {
+    const root = store.createTask(cwd, "Root", "Desc");
+    const flaky = store.createTask(cwd, "Flaky dependent", "Desc", [root.id]);
+    const unchanged = store.createTask(cwd, "Unchanged dependent", "Desc", [root.id]);
+
+    store.mutateTask(cwd, root.id, () => ({ status: "done", attempt_count: 2 }));
+    // Snapshot state of both dependents: blocked at lifetime 7 / baseline 3.
+    for (const task of [flaky, unchanged]) {
+      store.mutateTask(cwd, task.id, () => ({
+        status: "blocked",
+        attempt_count: 7,
+        budget_baseline: 3,
+        blocked_reason: "earlier failure",
+      }));
+    }
+
+    const result = cascadeResetWithInterleave(cwd, root.id, () => {
+      // The flaky dependent is unblocked and warm-claimed (lifetime 8), then
+      // its delivery fails: the shared exit re-blocks it with owner, token and
+      // completion cleared again. Every pre-attempt fence field matches the
+      // snapshot; only the attempt state reveals the newer block.
+      expect(store.unblockTask(cwd, flaky.id)?.status).toBe("todo");
+      const reservation = store.claimTaskForDispatch(cwd, flaky.id, "LateWorker", { maxAttempts: CAP });
+      expect(reservation?.attempt_count).toBe(8);
+      const exit = store.exitAttempt(cwd, flaky.id, {
+        owner: "LateWorker",
+        dispatchToken: reservation!.dispatch_token,
+        maxAttempts: CAP,
+      });
+      expect(exit.outcome).toBe("blocked");
+      expect(exit.task).toMatchObject({ status: "blocked", attempt_count: 8, budget_baseline: 3 });
+      expect(exit.task?.assigned_to).toBeUndefined();
+      expect(exit.task?.dispatch_token).toBeUndefined();
+      expect(exit.task?.completed_at).toBeUndefined();
+      expect(exit.task?.completed_dispatch).toBeUndefined();
+    });
+
+    expect(result.success).toBe(true);
+    expect(new Set(result.resetTasks?.map(t => t.id))).toEqual(new Set([root.id, unchanged.id]));
+
+    // The stale cascade neither clears the newer block nor renews its budget.
+    const flakyAfter = store.getTask(cwd, flaky.id)!;
+    expect(flakyAfter.status).toBe("blocked");
+    expect(flakyAfter.blocked_reason).toBe(`Max attempts (${CAP}) reached`);
+    expect(flakyAfter.attempt_count).toBe(8);
+    expect(flakyAfter.budget_baseline).toBe(3);
+    expect(store.attemptsSinceReset(flakyAfter)).toBe(CAP);
+    expect(flakyAfter.assigned_to).toBeUndefined();
+    expect(flakyAfter.dispatch_token).toBeUndefined();
+    const flakyProgress = store.getTaskProgress(cwd, flaky.id) ?? "";
+    expect(flakyProgress).toContain(`Cascade reset skipped ${flaky.id}`);
+    expect(flakyProgress).toContain("attempt state changed");
+    expect(flakyProgress).toContain("left untouched");
+
+    // An unchanged dependent still passes the fence and renews its own budget.
+    const unchangedAfter = store.getTask(cwd, unchanged.id)!;
+    expect(unchangedAfter.status).toBe("todo");
+    expect(unchangedAfter.attempt_count).toBe(7);
+    expect(unchangedAfter.budget_baseline).toBe(7);
+    expect(store.attemptsSinceReset(unchangedAfter)).toBe(0);
+  });
+
+  it("cascade-reset reaches a done grandchild through a todo intermediate", () => {
+    const root = store.createTask(cwd, "Root", "Desc");
+    const intermediate = store.createTask(cwd, "Todo intermediate", "Desc", [root.id]);
+    const grandchild = store.createTask(cwd, "Done grandchild", "Desc", [intermediate.id]);
+
+    store.mutateTask(cwd, root.id, () => ({ status: "done", attempt_count: 2 }));
+    // The intermediate intentionally stays todo: it must not truncate the walk.
+    store.mutateTask(cwd, grandchild.id, () => ({ status: "done", attempt_count: 4 }));
+
+    const result = executeTaskAction(cwd, "cascade-reset", root.id, "Operator");
+    expect(result.success).toBe(true);
+    expect(new Set(result.resetTasks?.map(t => t.id))).toEqual(new Set([root.id, grandchild.id]));
+
+    expect(store.getTask(cwd, root.id)).toMatchObject({ status: "todo", attempt_count: 2, budget_baseline: 2 });
+    expect(store.getTask(cwd, grandchild.id)).toMatchObject({ status: "todo", attempt_count: 4, budget_baseline: 4 });
+
+    // The todo intermediate needs no reset and is skipped with a note, but the
+    // grandchild behind it is still fenced and reset individually.
+    const intermediateAfter = store.getTask(cwd, intermediate.id)!;
+    expect(intermediateAfter.status).toBe("todo");
+    expect(intermediateAfter.attempt_count).toBe(0);
+    expect(intermediateAfter.budget_baseline).toBeUndefined();
+    const intermediateProgress = store.getTaskProgress(cwd, intermediate.id) ?? "";
+    expect(intermediateProgress).toContain(`Cascade reset skipped ${intermediate.id}`);
+    expect(intermediateProgress).toContain("already todo");
+    expect(intermediateProgress).toContain("left untouched");
+  });
+
+  it("cascade skip note names a status change and leaves the dependent untouched", () => {
+    const root = store.createTask(cwd, "Root", "Desc");
+    const child = store.createTask(cwd, "Status child", "Desc", [root.id]);
+    store.mutateTask(cwd, root.id, () => ({ status: "done" }));
+    store.mutateTask(cwd, child.id, () => ({
+      status: "blocked",
+      attempt_count: 3,
+      blocked_reason: "held for the fence test",
+    }));
+
+    const result = cascadeResetWithInterleave(cwd, root.id, () => {
+      // The operator unblocks the dependent after the subtree snapshot.
+      expect(store.unblockTask(cwd, child.id)?.status).toBe("todo");
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.resetTasks?.map(t => t.id)).toEqual([root.id]);
+    const after = store.getTask(cwd, child.id)!;
+    expect(after.status).toBe("todo"); // the interleaved unblock, not the cascade
+    expect(after.attempt_count).toBe(3);
+    expect(after.budget_baseline).toBeUndefined();
+    const progress = store.getTaskProgress(cwd, child.id) ?? "";
+    expect(progress).toContain("status changed from blocked to todo");
+    expect(progress).toContain("left untouched");
+  });
+
+  it("cascade skip note names an ownership change and leaves the dependent untouched", () => {
+    const root = store.createTask(cwd, "Root", "Desc");
+    const child = store.createTask(cwd, "Owned child", "Desc", [root.id]);
+    store.mutateTask(cwd, root.id, () => ({ status: "done" }));
+    store.mutateTask(cwd, child.id, () => ({
+      status: "blocked",
+      attempt_count: 3,
+      budget_baseline: 1,
+    }));
+
+    const result = cascadeResetWithInterleave(cwd, root.id, () => {
+      // A concurrent writer assigns the dependent after the subtree snapshot.
+      store.mutateTask(cwd, child.id, () => ({ assigned_to: "OtherWorker" }));
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.resetTasks?.map(t => t.id)).toEqual([root.id]);
+    const after = store.getTask(cwd, child.id)!;
+    expect(after).toMatchObject({
+      status: "blocked",
+      assigned_to: "OtherWorker",
+      attempt_count: 3,
+      budget_baseline: 1,
+    });
+    const progress = store.getTaskProgress(cwd, child.id) ?? "";
+    expect(progress).toContain("ownership changed from unassigned to OtherWorker");
+    expect(progress).toContain("left untouched");
+  });
+
+  it("cascade skip note names a completion change and leaves the dependent untouched", () => {
+    const root = store.createTask(cwd, "Root", "Desc");
+    const child = store.createTask(cwd, "Completed child", "Desc", [root.id]);
+    store.mutateTask(cwd, root.id, () => ({ status: "done" }));
+    store.mutateTask(cwd, child.id, () => ({
+      status: "done",
+      attempt_count: 2,
+      completed_at: "2026-01-01T00:00:00.000Z",
+      completed_dispatch: "dispatch-a",
+    }));
+
+    const result = cascadeResetWithInterleave(cwd, root.id, () => {
+      // A newer completion replaces the one captured by the subtree snapshot.
+      store.mutateTask(cwd, child.id, () => ({ completed_at: "2026-01-02T00:00:00.000Z" }));
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.resetTasks?.map(t => t.id)).toEqual([root.id]);
+    const after = store.getTask(cwd, child.id)!;
+    expect(after).toMatchObject({
+      status: "done",
+      completed_at: "2026-01-02T00:00:00.000Z",
+      completed_dispatch: "dispatch-a",
+      attempt_count: 2,
+    });
+    expect(after.budget_baseline).toBeUndefined();
+    const progress = store.getTaskProgress(cwd, child.id) ?? "";
+    expect(progress).toContain("completion changed");
+    expect(progress).toContain("left untouched");
+  });
+
+  it("a dependent deleted mid-cascade gets no note and no orphan progress file", () => {
+    const root = store.createTask(cwd, "Root", "Desc");
+    const child = store.createTask(cwd, "Vanishing child", "Desc", [root.id]);
+    store.mutateTask(cwd, root.id, () => ({ status: "done" }));
+    store.mutateTask(cwd, child.id, () => ({ status: "done", attempt_count: 2 }));
+
+    const result = cascadeResetWithInterleave(cwd, root.id, () => {
+      expect(store.deleteTask(cwd, child.id)).toBe(true);
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.resetTasks?.map(t => t.id)).toEqual([root.id]);
+    expect(store.getTask(cwd, child.id)).toBeNull();
+    // The vanished dependent must not be resurrected as a .progress.md orphan.
+    expect(fs.existsSync(path.join(dirs.tasksDir, `${child.id}.progress.md`))).toBe(false);
+    expect(store.getTaskProgress(cwd, child.id)).toBeNull();
+  });
+
   it("legacy records without a baseline keep lifetime accounting until an explicit reset", () => {
     const task = store.createTask(cwd, "Legacy task", "Desc");
     seedAttempts(cwd, task.id, CAP);
@@ -367,6 +683,9 @@ describe("crew/retry budget renewal", () => {
     expect(blocked.blocked_reason).toContain(`Max attempts (${CAP})`);
     expect(blocked.attempt_count).toBe(10);
     expect(blocked.budget_baseline).toBe(CAP);
+    const progress = store.getTaskProgress(cwd, atCap.id) ?? "";
+    expect(progress).toContain(`Auto-blocked after ${CAP} attempts (max: ${CAP})`);
+    expect(progress).not.toContain(`Auto-blocked after 10 attempts`);
 
     expect(spawnSpy).toHaveBeenCalledTimes(1);
     expect(response.details.attempted).toEqual([inBudget.id]);
@@ -408,7 +727,9 @@ describe("crew/retry budget renewal", () => {
 
   it("a refused explicit reset never renews the budget", () => {
     const task = store.createTask(cwd, "Active task", "Desc");
-    seedAttempts(cwd, task.id, CAP, CAP);
+    // Lifetime differs from the baseline so a baseline-only erroneous write
+    // (for example advancing it to attempt_count on refusal) is observable.
+    seedAttempts(cwd, task.id, 7, 3);
 
     const activeRefusal = executeTaskAction(cwd, "reset", task.id, "Operator", undefined, {
       isWorkerActive: () => true,
@@ -416,8 +737,8 @@ describe("crew/retry budget renewal", () => {
     expect(activeRefusal.success).toBe(false);
     expect(activeRefusal.error).toBe("active_worker");
     let current = store.getTask(cwd, task.id)!;
-    expect(current.attempt_count).toBe(CAP);
-    expect(current.budget_baseline).toBe(CAP); // pre-existing baseline untouched
+    expect(current.attempt_count).toBe(7);
+    expect(current.budget_baseline).toBe(3); // pre-existing baseline untouched
 
     store.mutateTask(cwd, task.id, () => ({ dispatch_token: "held-token" }));
     const fencedRefusal = executeTaskAction(cwd, "reset", task.id, "Operator", undefined, {
@@ -427,9 +748,22 @@ describe("crew/retry budget renewal", () => {
     expect(fencedRefusal.success).toBe(false);
     expect(fencedRefusal.error).toBe("reset_failed");
     current = store.getTask(cwd, task.id)!;
-    expect(current.attempt_count).toBe(CAP);
-    expect(current.budget_baseline).toBe(CAP);
+    expect(current.attempt_count).toBe(7);
+    expect(current.budget_baseline).toBe(3);
     expect(current.status).toBe("todo");
+
+    // Only the documented renewal path moves the baseline: a successful
+    // explicit reset advances the pre-existing baseline to the current
+    // lifetime count (7), never merely re-writing the old value.
+    const successful = executeTaskAction(cwd, "reset", task.id, "Operator", undefined, {
+      dispatchToken: "held-token",
+      crewIdentity: false,
+    });
+    expect(successful.success).toBe(true);
+    current = store.getTask(cwd, task.id)!;
+    expect(current.attempt_count).toBe(7);
+    expect(current.budget_baseline).toBe(7);
+    expect(store.attemptsSinceReset(current)).toBe(0);
   });
 
   it("a refused cascade-reset never renews any baseline", () => {

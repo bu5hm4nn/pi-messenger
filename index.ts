@@ -440,7 +440,7 @@ Usage (action-based API - preferred):
   pi_messenger({ action: "task.approve", id: "task-1" })        → Approve gated task
   pi_messenger({ action: "task.reject", id: "task-1", reason: "..." }) → Reject gated task and feed revision
   pi_messenger({ action: "task.done", id: "task-1", summary: "..." })
-  pi_messenger({ action: "task.reset", id: "task-1" })          → Reset task
+  pi_messenger({ action: "task.reset", id: "task-1" })          → Reset task and renew retry budget
   
   // Crew: Review
   pi_messenger({ action: "review", target: "task-1" })          → Review impl

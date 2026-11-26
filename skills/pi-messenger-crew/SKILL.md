@@ -111,6 +111,8 @@ pi_messenger({ action: "task.split", id: "task-3", subtasks: [
 ] })  // Execute: creates subtasks, parent becomes milestone
 ```
 
+`task.reset` is the only action that renews a task's retry budget. `work.maxAttemptsPerTask` counts attempts since the last explicit reset; automatic resets (review NEEDS_WORK bounces, crash/worker-exit recovery) and `task.unblock` never renew it. After a cap block, use `task.reset` (optionally `cascade: true`) to grant a fresh budget.
+
 ### 5. Task Revision
 ```typescript
 // Revise a single task's spec (planner rewrites based on your prompt)
@@ -121,7 +123,7 @@ pi_messenger({ action: "task.revise", id: "task-3", prompt: "add error handling 
 pi_messenger({ action: "task.revise-tree", id: "task-3", prompt: "split this into separate API and CLI tasks" })
 ```
 
-Single revision rewrites one task's spec. Tree revision rewrites an entire subtree — the planner can modify existing tasks, add new ones (capped at 2x subtree size), remove pending ones, and rewire dependencies. Done tasks in the subtree are preserved; revisable tasks reset to `todo`.
+Single revision rewrites one task's spec. Tree revision rewrites an entire subtree — the planner can modify existing tasks, add new ones (capped at 2x subtree size), remove pending ones, and rewire dependencies. Done tasks in the subtree are preserved; revisable tasks reset to `todo`. These automatic resets do not renew the retry budget.
 
 Both revisions are mutually exclusive (only one revision at a time).
 
@@ -310,7 +312,7 @@ Project-level (`.pi/messenger/crew/config.json`):
 | `thinking.analyst` | Thinking level for analyst agents | (from frontmatter) |
 | `planning.maxPasses` | Max planner/reviewer refinement passes | `1` |
 | `work.maxWaves` | Max autonomous waves | `50` |
-| `work.maxAttemptsPerTask` | Max attempts before auto-blocking a task | `5` |
+| `work.maxAttemptsPerTask` | Max attempts per explicit-reset budget before auto-blocking | `5` |
 | `work.stopOnBlock` | Stop autonomous mode when any task blocks | `false` |
 | `work.shutdownGracePeriodMs` | Grace period before SIGTERM on abort | `30000` |
 | `work.env` | Environment variables passed to spawned workers | `{}` |

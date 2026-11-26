@@ -318,15 +318,22 @@ describe("crew/store", () => {
       const claimedA = store.claimTaskForDispatch(cwd, task.id, "WaveA-aaaa");
       expect(claimedA?.status).toBe("todo");
       expect(claimedA?.assigned_to).toBe("WaveA-aaaa");
+      expect(claimedA?.attempt_count).toBe(1);
       const snapshot = store.getTask(cwd, task.id)!;
 
-      // Worker B (a separate pi process) starts the task between the
-      // orchestrator's snapshot read and its reset write.
-      const started = store.startTask(cwd, task.id, "WaveB-bbbb");
+      // Worker B (a separate pi process) takes the task over between the
+      // orchestrator's snapshot read and its reset write: the explicit reset
+      // invalidates A's reservation, then B claims and starts.
+      store.resetTask(cwd, task.id);
+      const claimedB = store.claimTaskForDispatch(cwd, task.id, "WaveB-bbbb");
+      expect(claimedB?.dispatch_token).toBeTruthy();
+      const started = store.startTask(cwd, task.id, "WaveB-bbbb", {
+        dispatchToken: claimedB!.dispatch_token,
+      });
       expect(started?.status).toBe("in_progress");
       expect(started?.assigned_to).toBe("WaveB-bbbb");
 
-      // The guarded reset re-reads under the per-task lock and must abort.
+      // The guarded reset re-reads under the per-task guard and must abort.
       const reset = store.mutateTask(cwd, task.id, current =>
         current.status === "todo" && current.assigned_to === snapshot.assigned_to
           ? { status: "todo", assigned_to: undefined }
@@ -337,7 +344,7 @@ describe("crew/store", () => {
       const after = store.getTask(cwd, task.id)!;
       expect(after.status).toBe("in_progress");
       expect(after.assigned_to).toBe("WaveB-bbbb");
-      expect(after.attempt_count).toBe(1);
+      expect(after.attempt_count).toBe(2);
       expect(after.started_at).toBeDefined();
     });
 
@@ -352,6 +359,18 @@ describe("crew/store", () => {
       const after = store.getTask(cwd, task.id)!;
       expect(after.status).toBe("in_progress");
       expect(after.assigned_to).toBe("WaveB-bbbb");
+    });
+
+    it("updateTask refuses lifecycle fields so every lifecycle write is guarded", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "Desc one");
+
+      for (const field of ["status", "assigned_to", "dispatch_token", "attempt_count", "completed_by", "completed_dispatch"]) {
+        expect(() => store.updateTask(cwd, task.id, { [field]: undefined } as never))
+          .toThrow(/cannot write lifecycle field/);
+      }
+      // Non-lifecycle fields still go through the generic guarded update.
+      expect(store.updateTask(cwd, task.id, { title: "Renamed" })?.title).toBe("Renamed");
     });
 
     it("resetTask(cascade: true) resets dependents recursively and syncs completed_count", () => {

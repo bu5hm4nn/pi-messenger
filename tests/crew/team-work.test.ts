@@ -67,7 +67,7 @@ describe("work with Team approval", () => {
     const gated = store.createTask(cwd, "High risk", "Edit auth", [], {
       approval: { required: true, status: "pending" },
     });
-    store.updateTask(cwd, gated.id, { attempt_count: 1 });
+    store.mutateTask(cwd, gated.id, () => ({ attempt_count: 1 }));
 
     const response = await workHandler.execute({}, dirs, createMockContext(cwd), vi.fn());
 
@@ -144,7 +144,9 @@ describe("work with Team approval", () => {
       approval: { required: true, status: "pending" },
     });
     vi.mocked(agents.spawnAgents).mockImplementation(async () => {
-      store.updateTask(cwd, first.id, { status: "done", completed_at: new Date().toISOString(), summary: "Done" });
+      const claimed = store.claimTaskForDispatch(cwd, first.id, "crew-worker");
+      store.startTask(cwd, first.id, "crew-worker", { dispatchToken: claimed?.dispatch_token });
+      store.completeTask(cwd, first.id, "Done", undefined, "crew-worker");
       return [{ exitCode: 0, output: "done", truncated: false, progress: { toolCallCount: 0, tokens: 0 }, agent: "crew-worker", taskId: first.id }];
     });
 

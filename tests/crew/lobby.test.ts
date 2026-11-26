@@ -25,7 +25,22 @@ vi.mock("../../crew/store.ts", () => ({
   getCrewDir: vi.fn((cwd: string) => `${cwd}/.pi/messenger/crew`),
   getTask: vi.fn(() => null),
   getBaseCommit: vi.fn(() => "abc1234"),
-  updateTask: vi.fn(),
+  claimTaskForDispatch: vi.fn((_cwd: string, taskId: string, workerName: string) => ({
+    id: taskId,
+    status: "todo",
+    assigned_to: workerName,
+    attempt_count: 1,
+    dispatch_token: "test-dispatch-token",
+  })),
+  startTask: vi.fn((_cwd: string, taskId: string, agentName: string, options?: { dispatchToken?: string }) => ({
+    id: taskId,
+    status: "in_progress",
+    assigned_to: agentName,
+    attempt_count: 1,
+    dispatch_token: options?.dispatchToken,
+  })),
+  exitAttempt: vi.fn(() => ({ outcome: "changed", task: null })),
+  releaseDispatch: vi.fn(),
   appendTaskProgress: vi.fn(),
 }));
 
@@ -306,11 +321,13 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-1";
 
-    vi.mocked(storeModule.getTask).mockReturnValue({
-      id: "task-1", title: "Test", status: "in_progress", attempt_count: 1,
-      depends_on: [], description: "", created_at: "", milestone: false,
-      assigned_to: worker.name,
-    } as any);
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({
+      outcome: "todo",
+      task: {
+        id: "task-1", title: "Test", status: "todo", attempt_count: 1,
+        depends_on: [], created_at: "", base_commit: "abc1234",
+      } as any,
+    });
 
     const proc = worker.proc as any;
     const closeHandler = proc._handlers["close"];
@@ -318,10 +335,10 @@ describe("lobby workers", () => {
 
     closeHandler(1);
 
-    expect(storeModule.updateTask).toHaveBeenCalledWith("/test/cwd", "task-1", {
-      status: "todo",
-      assigned_to: undefined,
-    });
+    // The ownership check and the write happen inside one guarded mutation.
+    expect(storeModule.exitAttempt).toHaveBeenCalledWith("/test/cwd", "task-1", expect.objectContaining({
+      owner: worker.name,
+    }));
     expect(storeModule.appendTaskProgress).toHaveBeenCalledWith(
       "/test/cwd", "task-1", "system",
       expect.stringContaining("indeterminate"),
@@ -334,6 +351,7 @@ describe("lobby workers", () => {
   it("close handler blocks task when max attempts exceeded", async () => {
     const storeModule = await import("../../crew/store.ts");
     const configModule = await import("../../crew/utils/config.ts");
+    const feedModule = await import("../../feed.ts");
     vi.mocked(configModule.loadCrewConfig).mockReturnValue({
       concurrency: { workers: 4 },
       models: {},
@@ -345,37 +363,37 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-2";
 
-    vi.mocked(storeModule.getTask).mockReturnValue({
-      id: "task-2", title: "Flaky", status: "in_progress", attempt_count: 3,
-      depends_on: [], description: "", created_at: "", milestone: false,
-      assigned_to: worker.name,
-    } as any);
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({ outcome: "blocked", task: null });
 
     const proc = worker.proc as any;
     proc._handlers["close"](1);
 
-    expect(storeModule.updateTask).toHaveBeenCalledWith("/test/cwd", "task-2", {
-      status: "blocked",
-      blocked_reason: expect.stringContaining("Max attempts"),
-      assigned_to: undefined,
-    });
+    expect(storeModule.exitAttempt).toHaveBeenCalledWith("/test/cwd", "task-2", expect.objectContaining({
+      owner: worker.name,
+      maxAttempts: 3,
+    }));
+    expect(feedModule.logFeedEvent).toHaveBeenCalledWith(
+      "/test/cwd", worker.name, "task.block", "task-2", "Max attempts reached",
+    );
   });
 
   it("close handler skips recovery if task already completed", async () => {
     const storeModule = await import("../../crew/store.ts");
-    vi.mocked(storeModule.getTask).mockReturnValue({
-      id: "task-3", title: "Done", status: "done", attempt_count: 1,
-      depends_on: [], description: "", created_at: "", milestone: false,
-    } as any);
 
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-3";
 
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({ outcome: "changed", task: null });
+
     const proc = worker.proc as any;
     proc._handlers["close"](0);
 
-    expect(storeModule.updateTask).not.toHaveBeenCalledWith(
-      "/test/cwd", "task-3", expect.objectContaining({ status: "todo" }),
+    // The guarded exit refused: a completed task is not reset or blocked.
+    expect(storeModule.exitAttempt).toHaveBeenCalledWith("/test/cwd", "task-3", expect.objectContaining({
+      owner: worker.name,
+    }));
+    expect(storeModule.appendTaskProgress).not.toHaveBeenCalledWith(
+      "/test/cwd", "task-3", "system", expect.stringContaining("Reset to todo"),
     );
   });
 
@@ -385,20 +403,16 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-4";
 
-    vi.mocked(storeModule.getTask).mockReturnValue({
-      id: "task-4", title: "Reassigned", status: "in_progress", attempt_count: 2,
-      depends_on: [], description: "", created_at: "", milestone: false,
-      assigned_to: "SomeOtherWorker",
-    } as any);
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({ outcome: "changed", task: null });
 
     const proc = worker.proc as any;
     proc._handlers["close"](0);
 
-    expect(storeModule.updateTask).not.toHaveBeenCalledWith(
-      "/test/cwd", "task-4", expect.objectContaining({ status: "todo" }),
-    );
-    expect(storeModule.updateTask).not.toHaveBeenCalledWith(
-      "/test/cwd", "task-4", expect.objectContaining({ status: "blocked" }),
+    expect(storeModule.exitAttempt).toHaveBeenCalledWith("/test/cwd", "task-4", expect.objectContaining({
+      owner: worker.name,
+    }));
+    expect(storeModule.appendTaskProgress).not.toHaveBeenCalledWith(
+      "/test/cwd", "task-4", "system", expect.stringContaining("Reset to todo"),
     );
   });
 
@@ -409,9 +423,11 @@ describe("lobby workers", () => {
     expect(budgets.moderate).toBeLessThan(budgets.chatty);
   });
 
-  it("spawnWorkerForTask spawns and immediately assigns", async () => {
+  it("spawnWorkerForTask claims, starts, spawns and forwards the dispatch token", async () => {
     const storeModule = await import("../../crew/store.ts");
     const feedModule = await import("../../feed.ts");
+    const { spawn } = await import("node:child_process");
+    vi.mocked(spawn).mockClear();
     vi.mocked(storeModule.getTask).mockReturnValueOnce({
       id: "task-5", title: "Build something", status: "todo", attempt_count: 0,
       depends_on: [], description: "", created_at: "", milestone: false,
@@ -421,11 +437,16 @@ describe("lobby workers", () => {
 
     expect(worker).not.toBeNull();
     expect(worker!.assignedTaskId).toBe("task-5");
-    expect(storeModule.updateTask).toHaveBeenCalledWith("/test/cwd", "task-5", expect.objectContaining({
-      status: "in_progress",
-      assigned_to: worker!.name,
-      attempt_count: 1,
-    }));
+    expect(storeModule.claimTaskForDispatch).toHaveBeenCalledWith("/test/cwd", "task-5", worker!.name, {
+      maxAttempts: undefined,
+    });
+    expect(storeModule.startTask).toHaveBeenCalledWith("/test/cwd", "task-5", worker!.name, {
+      baseCommit: "abc1234",
+      dispatchToken: "test-dispatch-token",
+    });
+    // The token reaches the spawned process through the environment, so the
+    // extension can attach it to task.start/task.done without the model.
+    expect(vi.mocked(spawn).mock.calls[0][2]!.env!.PI_CREW_DISPATCH).toBe("test-dispatch-token");
     expect(storeModule.appendTaskProgress).toHaveBeenCalledWith(
       "/test/cwd", "task-5", "system",
       expect.stringContaining("Assigned to worker"),

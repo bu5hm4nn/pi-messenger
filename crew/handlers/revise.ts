@@ -37,6 +37,11 @@ export async function executeRevise(
     store.appendTaskProgress(cwd, taskId, agentName, `Revision requested: "${prompt}"`);
   }
 
+  // Title/spec transforms are produced outside the guard; the generation
+  // captured here lets the guarded write abort instead of overwriting an edit
+  // that landed while the planner ran.
+  const specGeneration = task.generation ?? 0;
+
   const spec = store.getTaskSpec(cwd, taskId) ?? "";
   const progress = store.getTaskProgress(cwd, taskId) ?? "";
   const blockContext = store.getBlockContext(cwd, taskId) ?? "";
@@ -73,8 +78,23 @@ export async function executeRevise(
     return { success: false, message: msg };
   }
 
-  if (parsed.title) store.updateTask(cwd, taskId, { title: parsed.title });
-  store.setTaskSpec(cwd, taskId, parsed.spec);
+  try {
+    const applied = store.applyTaskRevision(
+      cwd,
+      taskId,
+      { title: parsed.title, spec: parsed.spec },
+      { expectedGeneration: specGeneration },
+    );
+    if (!applied) {
+      const msg = `Revision failed: task ${taskId} disappeared before the revised spec was applied`;
+      logFeedEvent(cwd, agentName, "task.revise", taskId, msg);
+      return { success: false, message: msg };
+    }
+  } catch (err) {
+    const msg = `Revision failed: ${err instanceof Error ? err.message : "stale spec generation"}`;
+    logFeedEvent(cwd, agentName, "task.revise", taskId, msg);
+    return { success: false, message: msg };
+  }
 
   const preview = prompt ? prompt.slice(0, 60) : "revised";
   logFeedEvent(cwd, agentName, "task.revise", taskId, preview);
@@ -160,6 +180,7 @@ export async function executeReviseTree(
 
   const existingEntries = parsed.filter(e => e.id);
   const newEntries = parsed.filter(e => !e.id && e.title);
+  const generations = new Map(subtreeAll.map(t => [t.id, t.generation ?? 0] as const));
 
   for (const entry of existingEntries) {
     if (!subtreeIds.has(entry.id!)) {
@@ -177,8 +198,23 @@ export async function executeReviseTree(
   }
 
   for (const entry of existingEntries) {
-    if (entry.title) store.updateTask(cwd, entry.id!, { title: entry.title });
-    store.setTaskSpec(cwd, entry.id!, entry.spec);
+    try {
+      const applied = store.applyTaskRevision(
+        cwd,
+        entry.id!,
+        { title: entry.title, spec: entry.spec },
+        { expectedGeneration: generations.get(entry.id!) },
+      );
+      if (!applied) {
+        const msg = `Tree revision failed: task ${entry.id} disappeared before its revised spec was applied`;
+        logFeedEvent(cwd, agentName, "task.revise-tree", taskId, msg);
+        return { success: false, message: msg };
+      }
+    } catch (err) {
+      const msg = `Tree revision failed: ${err instanceof Error ? err.message : "stale spec generation"}`;
+      logFeedEvent(cwd, agentName, "task.revise-tree", taskId, msg);
+      return { success: false, message: msg };
+    }
   }
 
   const titleToId = new Map<string, string>();
@@ -202,23 +238,15 @@ export async function executeReviseTree(
       if (resolved && resolved !== entryId) resolvedDeps.push(resolved);
     }
     if (resolvedDeps.length > 0) {
-      store.updateTask(cwd, entryId, { depends_on: resolvedDeps });
+      // Guarded write: no stale snapshot dependency list is ever published.
+      store.mutateTask(cwd, entryId, () => ({ depends_on: resolvedDeps }));
     }
   }
 
   for (const task of revisable) {
-    store.updateTask(cwd, task.id, {
-      status: "todo",
-      started_at: undefined,
-      completed_at: undefined,
-      base_commit: undefined,
-      assigned_to: undefined,
-      summary: undefined,
-      evidence: undefined,
-      completed_by: undefined,
-      blocked_reason: undefined,
-    });
-    store.cleanupBlockFiles(cwd, task.id);
+    // Takeover through the lifecycle mutation: clears completion attribution
+    // and invalidates any active dispatch token.
+    store.resetTask(cwd, task.id);
   }
 
   const preview = prompt ? prompt.slice(0, 60) : "revised tree";

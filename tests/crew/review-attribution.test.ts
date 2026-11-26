@@ -71,10 +71,19 @@ describe("auto-review completion attribution", () => {
 
     writeAgents(dirs.cwd);
     store.createPlan(dirs.cwd, "docs/PRD.md");
-    vi.mocked(reviewHandler.reviewImplementation).mockResolvedValue({
+    vi.mocked(reviewHandler.reviewImplementation).mockImplementation(async () => ({
       content: [{ type: "text", text: "Review" }],
-      details: { verdict: "SHIP" },
-    } as Awaited<ReturnType<typeof reviewHandler.reviewImplementation>>);
+      details: {
+        verdict: "SHIP",
+        feedback: {
+          verdict: "SHIP" as const,
+          summary: "Ship it",
+          issues: [],
+          suggestions: [],
+          reviewed_at: new Date().toISOString(),
+        },
+      },
+    } as Awaited<ReturnType<typeof reviewHandler.reviewImplementation>>));
   });
 
   it("A's exit-0 receipt after B completed is reported but not auto-reviewed", async () => {
@@ -85,11 +94,14 @@ describe("auto-review completion attribution", () => {
       store.claimTaskForDispatch(dirs.cwd, task.id, workerA);
       store.startTask(dirs.cwd, task.id, workerA);
 
-      // Worker B takes over in another process and completes first.
-      store.updateTask(dirs.cwd, task.id, { status: "todo", assigned_to: undefined });
-      store.claimTaskForDispatch(dirs.cwd, task.id, "WorkerB-bbbb");
-      store.startTask(dirs.cwd, task.id, "WorkerB-bbbb");
-      store.updateTask(dirs.cwd, task.id, { base_commit: "abc12345" });
+      // Worker B takes over in another process (explicit reset invalidates A's
+      // reservation) and completes first.
+      store.resetTask(dirs.cwd, task.id);
+      const claimedB = store.claimTaskForDispatch(dirs.cwd, task.id, "WorkerB-bbbb");
+      store.startTask(dirs.cwd, task.id, "WorkerB-bbbb", {
+        baseCommit: "abc12345",
+        dispatchToken: claimedB?.dispatch_token,
+      });
       store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB-bbbb");
 
       // A's exit-0 receipt arrives late, so it is not attributable to the
@@ -98,7 +110,16 @@ describe("auto-review completion attribution", () => {
     });
     vi.mocked(reviewHandler.reviewImplementation).mockResolvedValue({
       content: [{ type: "text", text: "Review" }],
-      details: { verdict: "NEEDS_WORK" },
+      details: {
+        verdict: "NEEDS_WORK",
+        feedback: {
+          verdict: "NEEDS_WORK" as const,
+          summary: "Needs work",
+          issues: ["Issue"],
+          suggestions: [],
+          reviewed_at: new Date().toISOString(),
+        },
+      },
     } as Awaited<ReturnType<typeof reviewHandler.reviewImplementation>>);
 
     const response = await workHandler.execute(
@@ -175,11 +196,27 @@ describe("auto-review completion attribution", () => {
       return [makeResult(task.id, workerA)];
     });
     vi.mocked(reviewHandler.reviewImplementation).mockImplementation(async () => {
-      // Another process re-completes the task while the reviewer is running.
-      store.updateTask(dirs.cwd, task.id, { completed_by: "WorkerB-bbbb" });
+      // Another process takes the task over and completes it while the
+      // reviewer is running: B's completion must survive A's NEEDS_WORK.
+      store.resetTask(dirs.cwd, task.id);
+      const claimedB = store.claimTaskForDispatch(dirs.cwd, task.id, "WorkerB-bbbb");
+      store.startTask(dirs.cwd, task.id, "WorkerB-bbbb", {
+        baseCommit: "abc12345",
+        dispatchToken: claimedB?.dispatch_token,
+      });
+      store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB-bbbb");
       return {
         content: [{ type: "text", text: "Review" }],
-        details: { verdict: "NEEDS_WORK" },
+        details: {
+          verdict: "NEEDS_WORK",
+          feedback: {
+            verdict: "NEEDS_WORK" as const,
+            summary: "Needs work",
+            issues: ["Issue"],
+            suggestions: [],
+            reviewed_at: new Date().toISOString(),
+          },
+        },
       } as Awaited<ReturnType<typeof reviewHandler.reviewImplementation>>;
     });
 
@@ -196,6 +233,9 @@ describe("auto-review completion attribution", () => {
     expect(after.status).toBe("done");
     expect(after.completed_by).toBe("WorkerB-bbbb");
     expect(after.review_count ?? 0).toBe(0);
+    // Feedback is applied only in the single guarded mutation, so the
+    // discarded verdict left no last_review behind either.
+    expect(after.last_review).toBeUndefined();
     expect(response.details.succeeded).toContain(task.id);
     expect(response.details.failed ?? []).toEqual([]);
 

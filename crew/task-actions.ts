@@ -8,6 +8,8 @@ export type TaskAction = "start" | "block" | "unblock" | "reset" | "cascade-rese
 
 export interface TaskActionOptions {
   isWorkerActive?: (taskId: string) => boolean;
+  /** Dispatch reservation carried by a spawned worker (PI_CREW_DISPATCH). */
+  dispatchToken?: string;
 }
 
 export interface TaskActionResult {
@@ -53,7 +55,12 @@ export function executeTaskAction(
           };
         }
       }
-      const started = store.startTask(cwd, taskId, agentName);
+      // git runs before the guard: no spawn/git inside a mutation.
+      const baseCommit = store.getBaseCommit(cwd);
+      const started = store.startTask(cwd, taskId, agentName, {
+        baseCommit,
+        dispatchToken: options?.dispatchToken,
+      });
       if (!started) return { success: false, error: "start_failed", message: `Failed to start ${taskId}` };
       logFeedEvent(cwd, agentName, "task.start", taskId, started.title);
       return { success: true, message: `Started ${taskId}`, task: started };
@@ -123,7 +130,9 @@ export function executeTaskAction(
       } else {
         store.appendTaskProgress(cwd, taskId, agentName, "Task unassigned (no active worker)");
       }
-      store.updateTask(cwd, taskId, { status: "todo", assigned_to: undefined });
+      // Stop is an explicit takeover: reset through the lifecycle mutation so
+      // the active dispatch token and completion attribution are invalidated.
+      store.resetTask(cwd, taskId);
       logFeedEvent(cwd, agentName, "task.reset", taskId, "stopped");
       return { success: true, message: `Stopped ${taskId}` };
     }

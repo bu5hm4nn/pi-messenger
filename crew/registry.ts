@@ -23,6 +23,8 @@ export interface LobbyWorkerEntry extends BaseWorkerEntry {
   type: "lobby";
   lobbyId: string;
   assignedTaskId: string | null;
+  /** Dispatch reservation held for the assigned task, if any. */
+  dispatchToken?: string;
   coordination: CoordinationLevel;
   startedAt: number;
   promptTmpDir: string | null;

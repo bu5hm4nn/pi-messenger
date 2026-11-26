@@ -90,7 +90,11 @@ describe("crew agent event handling", () => {
     expect(jsonl).toContain("text_delta");
   });
 
-  it("carries the dispatch workerName into PI_AGENT_NAME and the result", async () => {
+  it("carries the dispatch workerName and token into the environment and the result", async () => {
+    const store = await import("../../crew/store.ts");
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+
     const proc = createProcess();
     spawnMock.mockReturnValue(proc);
     const { spawnAgents } = await import("../../crew/agents.ts");
@@ -98,7 +102,7 @@ describe("crew agent event handling", () => {
     const resultPromise = spawnAgents([{
       agent: "crew-worker",
       task: "Implement task",
-      taskId: "task-1",
+      taskId: task.id,
       workerName: "WaveAWorker",
     }], dirs.cwd);
 
@@ -108,7 +112,31 @@ describe("crew agent event handling", () => {
     const [result] = await resultPromise;
 
     expect(spawnMock.mock.calls[0][2].env.PI_AGENT_NAME).toBe("WaveAWorker");
+    // The claim mints the token and the extension forwards it to the worker;
+    // the receipt carries the same value for stale-result fencing.
+    const envToken = spawnMock.mock.calls[0][2].env.PI_CREW_DISPATCH as string;
+    expect(envToken).toMatch(/^[0-9a-f-]{36}$/);
     expect(result.workerName).toBe("WaveAWorker");
+    expect(result.dispatchToken).toBe(envToken);
+    expect(store.getTask(dirs.cwd, task.id)?.dispatch_token).toBe(envToken);
+  });
+
+  it("skips a dispatch whose task no longer exists instead of spawning", async () => {
+    const proc = createProcess();
+    spawnMock.mockReturnValue(proc);
+    const { spawnAgents } = await import("../../crew/agents.ts");
+
+    const results = await spawnAgents([{
+      agent: "crew-worker",
+      task: "Implement task",
+      taskId: "task-missing",
+      workerName: "GhostWorker",
+    }], dirs.cwd);
+
+    expect(results).toHaveLength(1);
+    expect(results[0].skipped).toBe(true);
+    expect(results[0].error).toContain("no longer exists");
+    expect(spawnMock).not.toHaveBeenCalled();
   });
 
   it("injects and records the dispatch identity when crewRole is renamed", async () => {

@@ -174,30 +174,27 @@ function setPlanningOutline(cwd: string, content: string): void {
 }
 
 function pruneTransitiveDeps(cwd: string, taskIds: string[]): void {
-  const idDeps = new Map<string, string[]>();
-  for (const id of taskIds) {
-    const task = store.getTask(cwd, id);
-    if (task) idDeps.set(id, [...task.depends_on]);
-  }
-
+  // Reachability is read through the store on demand, and the list being
+  // pruned is the one read inside the task's own guarded mutation: a
+  // dependency added between planning and this write is never dropped.
   function isReachable(from: string, to: string, visited = new Set<string>()): boolean {
     if (visited.has(from)) return false;
     visited.add(from);
-    const deps = idDeps.get(from);
+    const deps = store.getTask(cwd, from)?.depends_on;
     if (!deps) return false;
     if (deps.includes(to)) return true;
     return deps.some(d => isReachable(d, to, visited));
   }
 
   for (const id of taskIds) {
-    const deps = idDeps.get(id);
-    if (!deps || deps.length < 2) continue;
-    const pruned = deps.filter(dep =>
-      !deps.some(other => other !== dep && isReachable(other, dep))
-    );
-    if (pruned.length < deps.length) {
-      store.updateTask(cwd, id, { depends_on: pruned });
-    }
+    store.mutateTask(cwd, id, current => {
+      const deps = current.depends_on;
+      if (deps.length < 2) return null;
+      const pruned = deps.filter(dep =>
+        !deps.some(other => other !== dep && isReachable(other, dep))
+      );
+      return pruned.length < deps.length ? { depends_on: pruned } : null;
+    });
   }
 }
 
@@ -494,7 +491,9 @@ export async function execute(
         }
       }
       if (resolvedDeps.length > 0) {
-        store.updateTask(cwd, task.id, { depends_on: resolvedDeps });
+        // Guarded write: the planner's resolved list is published under the
+        // task guard, never as a bare stale snapshot.
+        store.mutateTask(cwd, task.id, () => ({ depends_on: resolvedDeps }));
       }
     }
 

@@ -45,7 +45,18 @@ describe("auto-review skips blocked/duplicate tasks", () => {
 
     vi.mocked(reviewHandler.reviewImplementation).mockResolvedValue({
       content: [{ type: "text", text: "Review" }],
-      details: { verdict: "SHIP" },
+      // reviewImplementation now returns the feedback instead of persisting it;
+      // the caller applies it in one guarded mutation.
+      details: {
+        verdict: "SHIP",
+        feedback: {
+          verdict: "SHIP",
+          summary: "Ship it",
+          issues: [],
+          suggestions: [],
+          reviewed_at: new Date().toISOString(),
+        },
+      },
     } as Awaited<ReturnType<typeof reviewHandler.reviewImplementation>>);
   });
 

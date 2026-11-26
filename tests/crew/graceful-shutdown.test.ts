@@ -272,7 +272,11 @@ describe("crew/graceful shutdown", () => {
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async () => {
-      store.updateTask(dirs.cwd, task.id, { status: "in_progress", assigned_to: "crew-worker" });
+      // The worker reached task.start before the graceful shutdown.
+      store.mutateTask(dirs.cwd, task.id, () => ({
+        status: "in_progress",
+        assigned_to: "crew-worker",
+      }));
       return [{
         agent: "crew-worker",
         exitCode: 1,
@@ -377,7 +381,11 @@ describe("crew/graceful shutdown", () => {
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string }>) => {
       for (const t of tasks) {
         if (t.taskId) {
-          store.updateTask(dirs.cwd, t.taskId, { status: "done" });
+          // Complete through the lifecycle mutation (claim charges the attempt,
+          // start records the owner, done records the attribution).
+          const claimed = store.claimTaskForDispatch(dirs.cwd, t.taskId, "crew-worker");
+          store.startTask(dirs.cwd, t.taskId, "crew-worker", { dispatchToken: claimed?.dispatch_token });
+          store.completeTask(dirs.cwd, t.taskId, "Done", undefined, "crew-worker");
         }
       }
       return tasks.map(t => ({
@@ -418,7 +426,7 @@ describe("crew/graceful shutdown", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const t1 = store.createTask(dirs.cwd, "Flaky task", "Keeps failing");
 
-    store.updateTask(dirs.cwd, t1.id, { attempt_count: 5 });
+    store.mutateTask(dirs.cwd, t1.id, () => ({ attempt_count: 5 }));
 
     const spawnSpy = vi.spyOn(agents, "spawnAgents").mockImplementation(async () => []);
 

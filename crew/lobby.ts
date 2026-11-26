@@ -59,7 +59,32 @@ function lobbyTaskId(id: string): string {
   return `__lobby-${id}__`;
 }
 
-export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionModel?: string): LobbyWorker | null {
+export interface LobbySpawnOptions {
+  /** Task this worker is being spawned for (single-task spawn path). */
+  taskId?: string;
+  /** Dispatch reservation minted for that task. */
+  dispatchToken?: string;
+  /** Pre-allocated display name (the claim records the same identity). */
+  name?: string;
+}
+
+function allocateLobbyWorkerName(cwd: string): string {
+  let name = generateMemorableName();
+  for (let i = 0; i < 5; i++) {
+    const existing = registryGetLobbyWorkers(cwd);
+    const collision = existing.some(w => w.name === name && w.proc.exitCode === null);
+    if (!collision) break;
+    name = generateMemorableName();
+  }
+  return name;
+}
+
+export function spawnLobbyWorker(
+  cwd: string,
+  promptOverride?: string,
+  sessionModel?: string,
+  options?: LobbySpawnOptions,
+): LobbyWorker | null {
   const agents = discoverCrewAgents(cwd);
   const workerConfig = agents.find(a => a.name === "crew-worker");
   if (!workerConfig) return null;
@@ -71,13 +96,7 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
   intentionalShutdown.delete(cwd);
   idleActive.delete(cwd);
   const id = randomUUID().slice(0, 6);
-  let name = generateMemorableName();
-  for (let i = 0; i < 5; i++) {
-    const existing = registryGetLobbyWorkers(cwd);
-    const collision = existing.some(w => w.name === name && w.proc.exitCode === null);
-    if (!collision) break;
-    name = generateMemorableName();
-  }
+  const name = options?.name ?? allocateLobbyWorkerName(cwd);
   const prompt = promptOverride ?? buildLobbyPrompt(cwd, config);
 
   // `-ne` (--no-extensions) disables automatic extension discovery and the
@@ -128,7 +147,15 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
   args.push(prompt);
 
   const envOverrides = config.work.env ?? {};
-  const env = { ...process.env, ...envOverrides, PI_AGENT_NAME: name, PI_CREW_WORKER: "1", PI_LOBBY_ID: id };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...envOverrides,
+    PI_AGENT_NAME: name,
+    PI_CREW_WORKER: "1",
+    PI_LOBBY_ID: id,
+    // Dispatch token is attached by the extension; workers never copy it.
+    ...(options?.dispatchToken ? { PI_CREW_DISPATCH: options.dispatchToken } : {}),
+  };
 
   const proc = spawn(getPiCommand(), args, {
     cwd,
@@ -148,7 +175,8 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
     proc,
     taskId,
     startedAt: Date.now(),
-    assignedTaskId: null,
+    assignedTaskId: options?.taskId ?? null,
+    dispatchToken: options?.dispatchToken,
     coordination: config.coordination ?? "chatty",
     promptTmpDir,
     aliveFile,
@@ -199,24 +227,22 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
       try { fs.unlinkSync(worker.aliveFile); } catch {}
     }
     if (worker.assignedTaskId) {
-      const task = store.getTask(cwd, worker.assignedTaskId);
-      if (task && task.status === "in_progress" && task.assigned_to === worker.name) {
-        const config = loadCrewConfig(store.getCrewDir(cwd));
-        if (task.attempt_count >= config.work.maxAttemptsPerTask) {
-          store.updateTask(cwd, worker.assignedTaskId, {
-            status: "blocked",
-            blocked_reason: `Max attempts (${config.work.maxAttemptsPerTask}) reached`,
-            assigned_to: undefined,
-          });
-          logFeedEvent(cwd, worker.name, "task.block", worker.assignedTaskId, `Max attempts reached`);
-        } else {
-          const taskNow = store.getTask(cwd, worker.assignedTaskId);
-          const baseRef = taskNow?.base_commit ? ` Prior attempt base commit: ${taskNow.base_commit}.` : "";
-          store.updateTask(cwd, worker.assignedTaskId, { status: "todo", assigned_to: undefined });
-          store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
-            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing.${baseRef} Reset to todo.`);
-          logFeedEvent(cwd, worker.name, "task.reset", worker.assignedTaskId, "worker exited");
-        }
+      // One shared guarded exit: the ownership/token check and the write happen
+      // inside the mutation, so a task that was reassigned or completed while
+      // this worker was dying is left untouched.
+      const config = loadCrewConfig(store.getCrewDir(cwd));
+      const exit = store.exitAttempt(cwd, worker.assignedTaskId, {
+        owner: worker.name,
+        dispatchToken: worker.dispatchToken,
+        maxAttempts: config.work.maxAttemptsPerTask,
+      });
+      if (exit.outcome === "blocked") {
+        logFeedEvent(cwd, worker.name, "task.block", worker.assignedTaskId, `Max attempts reached`);
+      } else if (exit.outcome === "todo") {
+        const baseRef = exit.task?.base_commit ? ` Prior attempt base commit: ${exit.task.base_commit}.` : "";
+        store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
+          `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing.${baseRef} Reset to todo.`);
+        logFeedEvent(cwd, worker.name, "task.reset", worker.assignedTaskId, "worker exited");
       }
     } else {
       logFeedEvent(cwd, worker.name, "leave", undefined, `Lobby worker exited (code ${exitCode ?? "unknown"})`);
@@ -388,25 +414,46 @@ export function spawnWorkerForTask(
   sessionModel?: string,
 ): LobbyWorker | null {
   const task = store.getTask(cwd, taskId);
-  if (!task || task.status !== "todo") return null;
+  if (!task || task.status !== "todo" || task.dispatch_token) return null;
   if (hasActiveWorker(cwd, taskId)) return null;
 
-  const worker = spawnLobbyWorker(cwd, taskPrompt, sessionModel);
-  if (!worker) return null;
+  const config = loadCrewConfig(store.getCrewDir(cwd));
+  // The worker identity must exist before the claim: the reservation records
+  // assigned_to, and both task.start and the receipt are fenced by it.
+  const workerName = allocateLobbyWorkerName(cwd);
+  const claimed = store.claimTaskForDispatch(cwd, taskId, workerName, {
+    maxAttempts: config.work.maxAttemptsPerTask,
+  });
+  if (!claimed || !claimed.dispatch_token) return null;
+  const dispatchToken = claimed.dispatch_token;
+
+  const baseCommit = store.getBaseCommit(cwd); // git never runs inside the guard
+  const started = store.startTask(cwd, taskId, workerName, { baseCommit, dispatchToken });
+  if (!started) {
+    store.releaseDispatch(cwd, taskId, dispatchToken);
+    return null;
+  }
+
+  const worker = spawnLobbyWorker(cwd, taskPrompt, sessionModel, {
+    taskId,
+    dispatchToken,
+    name: workerName,
+  });
+  if (!worker) {
+    // Launch failed after the claim: release this dispatch's reservation.
+    store.exitAttempt(cwd, taskId, {
+      owner: workerName,
+      dispatchToken,
+      maxAttempts: config.work.maxAttemptsPerTask,
+    });
+    return null;
+  }
 
   removeLiveWorker(cwd, lobbyTaskId(worker.lobbyId));
-  worker.assignedTaskId = taskId;
   if (worker.aliveFile) {
     try { fs.unlinkSync(worker.aliveFile); } catch {}
   }
-  store.updateTask(cwd, taskId, {
-    status: "in_progress",
-    started_at: new Date().toISOString(),
-    base_commit: store.getBaseCommit(cwd),
-    assigned_to: worker.name,
-    attempt_count: task.attempt_count + 1,
-  });
-  store.appendTaskProgress(cwd, taskId, "system", `Assigned to worker ${worker.name} (attempt ${task.attempt_count + 1})`);
+  store.appendTaskProgress(cwd, taskId, "system", `Assigned to worker ${worker.name} (attempt ${claimed.attempt_count})`);
   logFeedEvent(cwd, worker.name, "task.start", taskId, task.title);
 
   return worker;

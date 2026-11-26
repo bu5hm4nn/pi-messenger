@@ -7,9 +7,21 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
-import type { Plan, Task, TaskApproval, TaskApprovalDecisionStatus, TaskEvidence } from "./types.ts";
+import { randomUUID } from "node:crypto";
+import type { Plan, ReviewFeedback, Task, TaskApproval, TaskApprovalDecisionStatus, TaskEvidence, TaskStatus } from "./types.ts";
 import { allocateTaskId } from "./id-allocator.ts";
 import { normalizeRiskLabels } from "./utils/risk-labels.ts";
+import {
+  acquireDirMutex,
+  dirMutexHeld,
+  releaseDirMutex,
+  tryAcquireDirMutex,
+  tryReclaimDirMutex,
+  setDirMutexLivenessProbe,
+  DirMutexTimeoutError,
+  type DirMutexHandle,
+  type DirMutexOptions,
+} from "../dir-mutex.ts";
 
 // =============================================================================
 // Directory Helpers
@@ -74,135 +86,144 @@ function writeText(filePath: string, content: string): void {
 }
 
 // =============================================================================
-// Per-task cross-process lock
+// Per-task cross-process guard
 // =============================================================================
 //
-// Every task read-check-write (orchestrator dispatch/reset and worker
-// task.start/task.done) is serialized through a per-task lock file. A plain
-// read then rename cannot provide compare-and-swap: two processes can both
-// read rev N and both rename their own write. The lock file is created with
-// `wx` (atomic across processes), held only for the short read/modify/write,
-// and cleaned up on release. Waits are bounded; a dead holder's lock is
-// reclaimed immediately (pid gone) or after the stale timeout.
+// Guards are non-empty directories in <crew>/tasks/.locks/<taskId>/ (plus
+// .locks/alloc/ for task-id allocation and deletion coordination). They are
+// deliberately not task files: task scans only read *.json, deletePlan skips
+// the .locks directory, and no task ever sees another task's guard.
+//
+// The mutex primitive itself lives in ../dir-mutex.ts; this section only maps
+// it onto task ids and defines the mutation contract.
 
-const TASK_LOCK_RETRY_MS = 10;
-const TASK_LOCK_TIMEOUT_MS = 5000;
-const TASK_LOCK_STALE_MS = 30000;
+const TASK_GUARD_TIMEOUT_MS = 5000;
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function getLocksDir(cwd: string): string {
+  return path.join(getTasksDir(cwd), ".locks");
+}
+
+export function getTaskGuardPath(cwd: string, taskId: string): string {
+  return path.join(getLocksDir(cwd), taskId);
+}
+
+export function getAllocGuardPath(cwd: string): string {
+  return path.join(getLocksDir(cwd), "alloc");
 }
 
 function getTaskPath(cwd: string, taskId: string): string {
   return path.join(getTasksDir(cwd), `${taskId}.json`);
 }
 
-function getTaskLockPath(cwd: string, taskId: string): string {
-  return path.join(getTasksDir(cwd), `${taskId}.lock`);
+function getTaskSpecPath(cwd: string, taskId: string): string {
+  return path.join(getTasksDir(cwd), `${taskId}.md`);
 }
 
-function isTaskLockStale(lockPath: string): boolean {
-  try {
-    const age = Date.now() - fs.statSync(lockPath).mtimeMs;
-    try {
-      const raw = JSON.parse(fs.readFileSync(lockPath, "utf-8")) as { pid?: unknown };
-      if (typeof raw.pid === "number" && raw.pid > 0) {
-        try {
-          process.kill(raw.pid, 0);
-          // A live holder is never stale, even if paused past the age limit:
-          // reclaiming its lock would allow overlapping read-modify-write.
-          return false;
-        } catch {
-          return true;
-        }
-      }
-    } catch {
-      // The holder may have created the file but not written its pid yet.
-    }
-    return age > TASK_LOCK_STALE_MS;
-  } catch {
-    // Lock disappeared between EEXIST and stat: treat as free.
-    return true;
+/** Directory-mutex handle for a task guard (exported for lifecycle/tests). */
+export type TaskGuardHandle = DirMutexHandle;
+
+export function acquireTaskGuard(
+  cwd: string,
+  taskId: string,
+  options?: DirMutexOptions,
+): TaskGuardHandle {
+  return acquireDirMutex(getTaskGuardPath(cwd, taskId), {
+    timeoutMs: options?.timeoutMs ?? TASK_GUARD_TIMEOUT_MS,
+    retryMs: options?.retryMs,
+  });
+}
+
+/** Single-shot acquisition; null means another holder has the guard. */
+export function tryAcquireTaskGuard(cwd: string, taskId: string): TaskGuardHandle | null {
+  return tryAcquireDirMutex(getTaskGuardPath(cwd, taskId));
+}
+
+export function releaseTaskGuard(handle: TaskGuardHandle): void {
+  releaseDirMutex(handle);
+}
+
+/** Reclaim only a guard whose marker is verified dead (see dir-mutex). */
+export function tryReclaimTaskGuard(cwd: string, taskId: string): boolean {
+  return tryReclaimDirMutex(getTaskGuardPath(cwd, taskId));
+}
+
+export function taskGuardHeld(cwd: string, taskId: string): boolean {
+  return dirMutexHeld(getTaskGuardPath(cwd, taskId));
+}
+
+/** Test seam for holder liveness; inert in production. */
+export function setGuardLivenessProbe(probe: ((pid: number) => "alive" | "dead" | "unknown") | null): void {
+  setDirMutexLivenessProbe(probe);
+}
+
+export { DirMutexTimeoutError as TaskLockTimeoutError };
+
+/**
+ * The lock was lost between the mutator's write decision and the publish
+ * (a reclaimer removed our marker because we looked dead). Aborting is the
+ * only safe outcome: publishing would race the new holder.
+ */
+export class TaskLockLostError extends Error {
+  readonly guardPath: string;
+  readonly markerName: string;
+
+  constructor(guardPath: string, markerName: string) {
+    super(
+      `Lost crew task guard ${guardPath} (own marker ${markerName} disappeared before publish); ` +
+      `the mutation was aborted instead of publishing over the new holder. Retry once all crew writers are idle.`,
+    );
+    this.name = "TaskLockLostError";
+    this.guardPath = guardPath;
+    this.markerName = markerName;
   }
 }
 
-function acquireTaskLock(cwd: string, taskId: string): string | null {
-  const lockPath = getTaskLockPath(cwd, taskId);
-  ensureDir(path.dirname(lockPath));
-  const deadline = Date.now() + TASK_LOCK_TIMEOUT_MS;
-
-  while (true) {
-    try {
-      const fd = fs.openSync(lockPath, "wx");
-      try {
-        fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now() }));
-      } finally {
-        fs.closeSync(fd);
-      }
-      return lockPath;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return null;
-      if (isTaskLockStale(lockPath)) {
-        try { fs.unlinkSync(lockPath); } catch {}
-        continue;
-      }
-      if (Date.now() >= deadline) return null;
-      sleepSync(TASK_LOCK_RETRY_MS);
-    }
-  }
-}
-
-function releaseTaskLock(lockPath: string): void {
-  try {
-    const raw = JSON.parse(fs.readFileSync(lockPath, "utf-8")) as { pid?: unknown };
-    if (typeof raw.pid === "number" && raw.pid !== process.pid) return;
-  } catch {
-    // Unreadable lock is ours or already gone; fall through and unlink.
-  }
-  try { fs.unlinkSync(lockPath); } catch {}
+export interface TaskMutationContext {
+  guardPath: string;
+  markerName: string;
 }
 
 /**
  * Guarded task mutation. The mutator runs against the freshly-read task while
- * holding the per-task lock; returning null aborts without writing. Callers
- * must express their check (status/owner/attempt budget) inside the mutator,
- * not against a snapshot read before the call.
+ * holding the per-task guard; returning null aborts without writing. Callers
+ * must express their check (status/owner/dispatch token/attempt budget)
+ * inside the mutator, not against a snapshot read before the call.
+ *
+ * No await, spawn or git may run inside a mutator: the guard is held for the
+ * duration and everything else waits behind it.
  */
 export function mutateTask(
   cwd: string,
   taskId: string,
-  mutate: (task: Task) => Partial<Task> | null
+  mutate: (task: Task, guard: TaskMutationContext) => Partial<Task> | null,
 ): Task | null {
-  const lockPath = acquireTaskLock(cwd, taskId);
-  if (!lockPath) return null;
-
+  const guard = acquireTaskGuard(cwd, taskId);
   try {
     const task = getTask(cwd, taskId);
+    // A mutation that finds no task file must not write one back: that is how
+    // a deleted task gets resurrected.
     if (!task) return null;
-    const updates = mutate(task);
+
+    const updates = mutate(task, { guardPath: guard.guardPath, markerName: guard.markerName });
     if (!updates) return null;
+
+    // Pre-publish guard: one stat. If reclaimers removed our marker we look
+    // dead, so publishing now would collide with whoever holds the guard.
+    if (!fs.existsSync(path.join(guard.guardPath, guard.markerName))) {
+      throw new TaskLockLostError(guard.guardPath, guard.markerName);
+    }
 
     const updated: Task = {
       ...task,
       ...updates,
       updated_at: new Date().toISOString(),
+      rev: (task.rev ?? 0) + 1,
     };
     writeJson(getTaskPath(cwd, taskId), updated);
     return updated;
   } finally {
-    releaseTaskLock(lockPath);
+    releaseTaskGuard(guard);
   }
-}
-
-/**
- * Record dispatch ownership. Must be called immediately before a worker
- * process is spawned, never while building a wave queue: a task cancelled
- * before launch must not keep an assignee that never existed.
- */
-export function claimTaskForDispatch(cwd: string, taskId: string, workerName: string): Task | null {
-  return mutateTask(cwd, taskId, task =>
-    task.status === "todo" ? { assigned_to: workerName } : null
-  );
 }
 
 // =============================================================================
@@ -256,31 +277,60 @@ export function deletePlan(cwd: string): boolean {
   const tasksDir = getTasksDir(cwd);
   
   let deleted = false;
-  
-  // Delete plan.json
-  if (fs.existsSync(planPath)) {
-    fs.unlinkSync(planPath);
-    deleted = true;
-  }
-  
-  // Delete plan.md
-  if (fs.existsSync(planMdPath)) {
-    fs.unlinkSync(planMdPath);
-  }
-  
-  // Delete all task files
-  if (fs.existsSync(tasksDir)) {
-    for (const file of fs.readdirSync(tasksDir)) {
-      fs.unlinkSync(path.join(tasksDir, file));
-    }
-  }
 
-  // Delete all block files
-  const blocksDir = getBlocksDir(cwd);
-  if (fs.existsSync(blocksDir)) {
-    for (const file of fs.readdirSync(blocksDir)) {
-      fs.unlinkSync(path.join(blocksDir, file));
+  // Allocation is serialized against creates so no id is handed out while the
+  // board is being wiped.
+  const allocGuard = acquireDirMutex(getAllocGuardPath(cwd));
+
+  try {
+    // Delete plan.json
+    if (fs.existsSync(planPath)) {
+      fs.unlinkSync(planPath);
+      deleted = true;
     }
+
+    // Delete plan.md
+    if (fs.existsSync(planMdPath)) {
+      fs.unlinkSync(planMdPath);
+    }
+
+    // Delete task files, but never sweep a live guard or an in-flight temp
+    // file. A task whose guard is held is skipped: its writer owns it.
+    if (fs.existsSync(tasksDir)) {
+      const skipped = new Set<string>();
+      for (const entry of fs.readdirSync(tasksDir)) {
+        if (entry === ".locks" || entry.startsWith(".")) continue;
+        if (entry.includes(".tmp-")) continue;
+        const fullPath = path.join(tasksDir, entry);
+        let isFile = false;
+        try { isFile = fs.statSync(fullPath).isFile(); } catch { continue; }
+        if (!isFile) continue;
+
+        const taskMatch = entry.match(/^(task-\d+)\./);
+        if (taskMatch) {
+          const taskId = taskMatch[1];
+          if (skipped.has(taskId)) continue;
+          const guard = tryAcquireTaskGuard(cwd, taskId);
+          if (!guard) {
+            skipped.add(taskId);
+            continue;
+          }
+          try { fs.unlinkSync(fullPath); } finally { releaseTaskGuard(guard); }
+        } else {
+          fs.unlinkSync(fullPath);
+        }
+      }
+    }
+
+    // Delete all block files
+    const blocksDir = getBlocksDir(cwd);
+    if (fs.existsSync(blocksDir)) {
+      for (const file of fs.readdirSync(blocksDir)) {
+        try { fs.unlinkSync(path.join(blocksDir, file)); } catch {}
+      }
+    }
+  } finally {
+    releaseTaskGuard(allocGuard);
   }
   
   return deleted;
@@ -310,32 +360,57 @@ export function createTask(
   dependsOn?: string[],
   options?: Pick<Task, "role" | "risk_labels" | "approval" | "skills" | "model">
 ): Task {
-  const id = allocateTaskId(cwd);
+  const tasksDir = getTasksDir(cwd);
+  ensureDir(tasksDir);
   const now = new Date().toISOString();
   const riskLabels = normalizeRiskLabels(options?.risk_labels);
 
-  const task: Task = {
-    id,
-    title,
-    status: "todo",
-    depends_on: dependsOn ?? [],
-    ...(options?.model ? { model: options.model } : {}),
-    ...(options?.role ? { role: options.role } : {}),
-    ...(riskLabels ? { risk_labels: riskLabels } : {}),
-    ...(options?.approval ? { approval: options.approval } : {}),
-    ...(options?.skills && options.skills.length > 0 ? { skills: options.skills } : {}),
-    created_at: now,
-    updated_at: now,
-    attempt_count: 0,
-  };
+  // The alloc guard serializes "scan for the next id" and "reserve that id":
+  // two processes can otherwise both scan task-4 and one would overwrite the
+  // other's task file.
+  const allocGuard = acquireDirMutex(getAllocGuardPath(cwd));
+  let task: Task;
+  try {
+    for (;;) {
+      const id = allocateTaskId(cwd);
+      const taskPath = getTaskPath(cwd, id);
+      try {
+        // wx-create reserves the id. EEXIST means another allocator won the
+        // race even though we hold the alloc guard (e.g. a crashed holder's
+        // id was already on disk); rescan.
+        fs.writeFileSync(taskPath, "", { flag: "wx" });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
+        throw err;
+      }
 
-  writeJson(path.join(getTasksDir(cwd), `${id}.json`), task);
+      task = {
+        id,
+        title,
+        status: "todo",
+        depends_on: dependsOn ?? [],
+        ...(options?.model ? { model: options.model } : {}),
+        ...(options?.role ? { role: options.role } : {}),
+        ...(riskLabels ? { risk_labels: riskLabels } : {}),
+        ...(options?.approval ? { approval: options.approval } : {}),
+        ...(options?.skills && options.skills.length > 0 ? { skills: options.skills } : {}),
+        created_at: now,
+        updated_at: now,
+        attempt_count: 0,
+      };
+
+      writeJson(taskPath, task);
+      break;
+    }
+  } finally {
+    releaseTaskGuard(allocGuard);
+  }
 
   // Create task spec file
   const specContent = description
     ? `# ${title}\n\n${description}\n`
     : `# ${title}\n\n*Spec pending*\n`;
-  writeText(path.join(getTasksDir(cwd), `${id}.md`), specContent);
+  writeText(getTaskSpecPath(cwd, task.id), specContent);
 
   // Update plan task count
   const plan = getPlan(cwd);
@@ -373,15 +448,41 @@ function normalizeTask(raw: Task): Task {
     risk_labels: normalizeRiskLabels(Array.isArray(raw.risk_labels) ? raw.risk_labels.filter(s => typeof s === "string") : undefined),
     approval,
     attempt_count: typeof raw.attempt_count === "number" ? raw.attempt_count : 0,
+    dispatch_token: typeof raw.dispatch_token === "string" ? raw.dispatch_token : undefined,
+    completed_dispatch: typeof raw.completed_dispatch === "string" ? raw.completed_dispatch : undefined,
+    rev: typeof raw.rev === "number" ? raw.rev : 0,
+    generation: typeof raw.generation === "number" ? raw.generation : 0,
   };
 }
 
 export function getTask(cwd: string, taskId: string): Task | null {
-  const raw = readJson<Task>(path.join(getTasksDir(cwd), `${taskId}.json`));
+  const raw = readJson<Task>(getTaskPath(cwd, taskId));
   return raw ? normalizeTask(raw) : null;
 }
 
+/**
+ * Fields owned by the lifecycle mutations. A generic update must not write
+ * them: those checks (status/owner/token/attempt budget) only exist inside
+ * claimTaskForDispatch/startTask/completeTask/exitAttempt/resetTask/etc.
+ */
+const LIFECYCLE_FIELDS = [
+  "status",
+  "assigned_to",
+  "dispatch_token",
+  "attempt_count",
+  "completed_by",
+  "completed_dispatch",
+] as const;
+
 export function updateTask(cwd: string, taskId: string, updates: Partial<Task>): Task | null {
+  for (const field of LIFECYCLE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(updates, field)) {
+      throw new Error(
+        `updateTask cannot write lifecycle field "${field}" on ${taskId}; ` +
+        `use claimTaskForDispatch/startTask/completeTask/blockTask/unblockTask/resetTask/applyReview instead`,
+      );
+    }
+  }
   return mutateTask(cwd, taskId, () => updates);
 }
 
@@ -405,7 +506,7 @@ export function getTasks(cwd: string): Task[] {
 }
 
 export function getTaskSpec(cwd: string, taskId: string): string | null {
-  return readText(path.join(getTasksDir(cwd), `${taskId}.md`));
+  return readText(getTaskSpecPath(cwd, taskId));
 }
 
 export function appendTaskProgress(cwd: string, taskId: string, agent: string, message: string): void {
@@ -424,29 +525,100 @@ export function getBlockContext(cwd: string, taskId: string): string | null {
   return readText(path.join(getBlocksDir(cwd), `${taskId}.md`));
 }
 
-export function setTaskSpec(cwd: string, taskId: string, content: string): void {
-  writeText(path.join(getTasksDir(cwd), `${taskId}.md`), content);
-  updateTask(cwd, taskId, {}); // Touch updated_at
+// =============================================================================
+// Spec edits (generation-preconditioned)
+// =============================================================================
+
+export class StaleTaskGenerationError extends Error {
+  readonly taskId: string;
+  readonly expected: number;
+  readonly actual: number;
+
+  constructor(taskId: string, expected: number, actual: number) {
+    super(
+      `Task ${taskId} changed while an edit was in flight (expected generation ${expected}, found ${actual}); ` +
+      `re-read the task and retry so the newer edit is not overwritten.`,
+    );
+    this.name = "StaleTaskGenerationError";
+    this.taskId = taskId;
+    this.expected = expected;
+    this.actual = actual;
+  }
+}
+
+export interface SpecEditOptions {
+  /** Abort unless the task's spec generation is still this value. */
+  expectedGeneration?: number;
+}
+
+function assertGeneration(task: Task, options?: SpecEditOptions): void {
+  if (options?.expectedGeneration === undefined) return;
+  const actual = task.generation ?? 0;
+  if (actual !== options.expectedGeneration) {
+    throw new StaleTaskGenerationError(task.id, options.expectedGeneration, actual);
+  }
+}
+
+export interface TaskRevisionInput {
+  title?: string;
+  spec: string;
+}
+
+/**
+ * Apply a spec (and optional title) under the task guard. Spec/title
+ * transforms are computed outside the lock (an agent produced them), so they
+ * carry an expected generation and abort rather than overwrite a newer edit.
+ */
+export function applyTaskRevision(
+  cwd: string,
+  taskId: string,
+  revision: TaskRevisionInput,
+  options?: SpecEditOptions,
+): Task | null {
+  const updated = mutateTask(cwd, taskId, task => {
+    assertGeneration(task, options);
+    return {
+      ...(revision.title ? { title: revision.title } : {}),
+      generation: (task.generation ?? 0) + 1,
+    };
+  });
+  if (!updated) return null;
+  writeText(getTaskSpecPath(cwd, taskId), revision.spec);
+  return updated;
+}
+
+export function setTaskSpec(cwd: string, taskId: string, content: string, options?: SpecEditOptions): boolean {
+  return applyTaskRevision(cwd, taskId, { spec: content }, options) !== null;
 }
 
 export function deleteTask(cwd: string, taskId: string): boolean {
-  const task = getTask(cwd, taskId);
-  if (!task) return false;
+  // Hold the task guard across read + unlink so a concurrent mutation cannot
+  // read the task, lose the guard, and publish it back after the delete.
+  const guard = acquireTaskGuard(cwd, taskId);
+  let task: Task | null;
+  try {
+    task = getTask(cwd, taskId);
+    if (!task) return false;
 
-  const tasksDir = getTasksDir(cwd);
-  for (const ext of [".json", ".md", ".progress.md"]) {
-    try { fs.unlinkSync(path.join(tasksDir, `${taskId}${ext}`)); } catch {}
+    const tasksDir = getTasksDir(cwd);
+    for (const ext of [".json", ".md", ".progress.md"]) {
+      try { fs.unlinkSync(path.join(tasksDir, `${taskId}${ext}`)); } catch {}
+    }
+
+    try { fs.unlinkSync(path.join(getBlocksDir(cwd), `${taskId}.md`)); } catch {}
+  } finally {
+    releaseTaskGuard(guard);
   }
 
-  try { fs.unlinkSync(path.join(getBlocksDir(cwd), `${taskId}.md`)); } catch {}
-
-  const allTasks = getTasks(cwd);
-  for (const t of allTasks) {
-    if (t.depends_on.includes(taskId)) {
-      updateTask(cwd, t.id, {
-        depends_on: t.depends_on.filter(d => d !== taskId),
-      });
-    }
+  // Dependents: the filter is computed from the task state read *inside* the
+  // dependent's mutation, so a dependency added after our snapshot survives.
+  for (const t of getTasks(cwd)) {
+    if (!t.depends_on.includes(taskId)) continue;
+    mutateTask(cwd, t.id, current =>
+      current.depends_on.includes(taskId)
+        ? { depends_on: current.depends_on.filter(d => d !== taskId) }
+        : null
+    );
   }
 
   const plan = getPlan(cwd);
@@ -478,37 +650,112 @@ export function getBaseCommit(cwd: string): string | undefined {
   }
 }
 
-export function startTask(cwd: string, taskId: string, agentName: string): Task | null {
-  return mutateTask(cwd, taskId, task => task.status === "todo"
-    ? {
-        status: "in_progress",
-        started_at: new Date().toISOString(),
-        base_commit: getBaseCommit(cwd),
-        assigned_to: agentName,
-        attempt_count: task.attempt_count + 1,
-      }
-    : null
-  );
+export interface ClaimOptions {
+  /** Refuse the claim at/above this many attempts (cap re-checked here). */
+  maxAttempts?: number;
 }
 
+/**
+ * Reserve a todo task for one dispatch. The reservation is the dispatch
+ * token; the attempt is charged exactly here, once per dispatch, so a worker
+ * that never reaches task.start still consumed its budget.
+ */
+export function claimTaskForDispatch(
+  cwd: string,
+  taskId: string,
+  workerName: string,
+  options?: ClaimOptions,
+): Task | null {
+  const maxAttempts = options?.maxAttempts ?? Number.POSITIVE_INFINITY;
+  return mutateTask(cwd, taskId, task => {
+    if (task.status !== "todo") return null;
+    if (task.dispatch_token) return null;
+    const attemptCount = task.attempt_count ?? 0;
+    if (attemptCount >= maxAttempts) return null;
+    return {
+      dispatch_token: randomUUID(),
+      assigned_to: workerName,
+      attempt_count: attemptCount + 1,
+    };
+  });
+}
+
+export interface StartOptions {
+  /** Base commit computed by the caller before acquiring the guard. */
+  baseCommit?: string;
+  /** Dispatch token this start must match (spawned worker path). */
+  dispatchToken?: string;
+}
+
+/**
+ * todo -> in_progress. With a dispatch token the start must match the
+ * reservation and does not re-charge the attempt; a manual human start mints
+ * a session-held token and charges the attempt here.
+ */
+export function startTask(
+  cwd: string,
+  taskId: string,
+  agentName: string,
+  options?: StartOptions,
+): Task | null {
+  const baseCommit = options?.baseCommit;
+  const dispatchToken = options?.dispatchToken;
+  return mutateTask(cwd, taskId, task => {
+    if (task.status !== "todo") return null;
+    if (dispatchToken !== undefined) {
+      if (task.dispatch_token !== dispatchToken) return null;
+    } else if (task.dispatch_token && task.assigned_to !== agentName) {
+      // Reserved for another dispatch: only its owner may start it.
+      return null;
+    }
+    const alreadyCharged = task.dispatch_token !== undefined;
+    return {
+      status: "in_progress",
+      started_at: new Date().toISOString(),
+      base_commit: baseCommit,
+      assigned_to: agentName,
+      attempt_count: alreadyCharged ? task.attempt_count : task.attempt_count + 1,
+      dispatch_token: task.dispatch_token ?? randomUUID(),
+    };
+  });
+}
+
+export interface CompleteOptions {
+  /** Dispatch token carried by the worker (PI_CREW_DISPATCH). */
+  dispatchToken?: string;
+}
+
+/**
+ * in_progress -> done. Requires the live reservation (token) or, for callers
+ * without a token (lobby/manual), the recorded owner to match.
+ */
 export function completeTask(
   cwd: string,
   taskId: string,
   summary: string,
   evidence?: TaskEvidence,
   completedBy?: string,
+  options?: CompleteOptions,
 ): Task | null {
-  const updated = mutateTask(cwd, taskId, task => task.status === "in_progress"
-    ? {
-        status: "done",
-        completed_at: new Date().toISOString(),
-        summary,
-        evidence,
-        assigned_to: undefined,
-        completed_by: completedBy,
-      }
-    : null
-  );
+  const dispatchToken = options?.dispatchToken;
+  const updated = mutateTask(cwd, taskId, task => {
+    if (task.status !== "in_progress") return null;
+    if (dispatchToken !== undefined) {
+      if (task.dispatch_token !== dispatchToken) return null;
+    } else if (completedBy !== undefined && task.assigned_to !== completedBy) {
+      return null;
+    }
+    return {
+      status: "done",
+      completed_at: new Date().toISOString(),
+      summary,
+      evidence,
+      assigned_to: undefined,
+      completed_by: completedBy,
+      completed_dispatch: task.dispatch_token,
+      dispatch_token: undefined,
+    };
+  });
 
   // Update plan completed count
   if (updated) {
@@ -523,12 +770,29 @@ export function completeTask(
   return updated;
 }
 
-export function blockTask(cwd: string, taskId: string, reason: string): Task | null {
-  const updated = mutateTask(cwd, taskId, () => ({
-    status: "blocked",
-    blocked_reason: reason,
-    assigned_to: undefined,
-  }));
+export interface LifecycleFence {
+  /** Only proceed while the task is assigned to this identity. */
+  owner?: string;
+  /** Only proceed while this dispatch token is the live reservation. */
+  dispatchToken?: string;
+}
+
+export function blockTask(
+  cwd: string,
+  taskId: string,
+  reason: string,
+  fence?: LifecycleFence,
+): Task | null {
+  const updated = mutateTask(cwd, taskId, task => {
+    if (fence?.dispatchToken !== undefined && task.dispatch_token !== fence.dispatchToken) return null;
+    if (fence?.owner !== undefined && task.assigned_to !== fence.owner) return null;
+    return {
+      status: "blocked",
+      blocked_reason: reason,
+      assigned_to: undefined,
+      dispatch_token: undefined,
+    };
+  });
   if (!updated) return null;
 
   // Write block context to blocks directory
@@ -538,37 +802,59 @@ export function blockTask(cwd: string, taskId: string, reason: string): Task | n
   return updated;
 }
 
-export function unblockTask(cwd: string, taskId: string): Task | null {
-  const updated = mutateTask(cwd, taskId, task => task.status === "blocked"
-    ? {
-        status: "todo",
-        blocked_reason: undefined,
-      }
-    : null
-  );
+const REOPEN_CLEARS: Partial<Task> = {
+  started_at: undefined,
+  completed_at: undefined,
+  base_commit: undefined,
+  assigned_to: undefined,
+  summary: undefined,
+  evidence: undefined,
+  completed_by: undefined,
+  completed_dispatch: undefined,
+  blocked_reason: undefined,
+  dispatch_token: undefined,
+};
+
+/**
+ * blocked -> todo (explicit takeover). Reopening invalidates the active
+ * dispatch token and the completion attribution.
+ */
+export function unblockTask(cwd: string, taskId: string, fence?: LifecycleFence): Task | null {
+  const updated = mutateTask(cwd, taskId, task => {
+    if (task.status !== "blocked") return null;
+    if (fence?.dispatchToken !== undefined && task.dispatch_token !== fence.dispatchToken) return null;
+    if (fence?.owner !== undefined && task.assigned_to !== fence.owner) return null;
+    return { status: "todo", ...REOPEN_CLEARS };
+  });
   if (!updated) return null;
 
   cleanupBlockFiles(cwd, taskId);
   return updated;
 }
 
-export function resetTask(cwd: string, taskId: string, cascade: boolean = false): Task[] {
+export interface ResetTaskOptions extends LifecycleFence {
+  expectedStatus?: TaskStatus;
+}
+
+export function resetTask(
+  cwd: string,
+  taskId: string,
+  cascade: boolean = false,
+  options?: ResetTaskOptions,
+): Task[] {
   const resetTasks: Task[] = [];
   let wasDone = false;
 
-  // Reset this task
+  // Reset this task (explicit takeover: clears completion attribution and any
+  // live dispatch reservation).
   const updated = mutateTask(cwd, taskId, task => {
+    if (options?.expectedStatus !== undefined && task.status !== options.expectedStatus) return null;
+    if (options?.dispatchToken !== undefined && task.dispatch_token !== options.dispatchToken) return null;
+    if (options?.owner !== undefined && task.assigned_to !== options.owner) return null;
     wasDone = task.status === "done";
     return {
       status: "todo",
-      started_at: undefined,
-      completed_at: undefined,
-      base_commit: undefined,
-      assigned_to: undefined,
-      summary: undefined,
-      evidence: undefined,
-      completed_by: undefined,
-      blocked_reason: undefined,
+      ...REOPEN_CLEARS,
       // Keep attempt_count for tracking
     };
   });
@@ -600,18 +886,143 @@ export function resetTask(cwd: string, taskId: string, cascade: boolean = false)
   return resetTasks;
 }
 
+/** Release a reservation whose launch/delivery failed, only if it still matches. */
+export function releaseDispatch(cwd: string, taskId: string, dispatchToken: string): Task | null {
+  return mutateTask(cwd, taskId, task => {
+    if (task.dispatch_token !== dispatchToken) return null;
+    if (task.status === "done" || task.status === "blocked") return null;
+    return {
+      dispatch_token: undefined,
+      ...(task.status === "todo" ? { assigned_to: undefined } : {}),
+    };
+  });
+}
+
+export interface ExitAttemptOptions extends LifecycleFence {
+  maxAttempts?: number;
+}
+
+export interface ExitAttemptResult {
+  outcome: "blocked" | "todo" | "missing" | "changed";
+  task: Task | null;
+}
+
+/**
+ * One guarded exit used by every crash/receipt path (work.ts receipts and the
+ * lobby close handler). The attempt was already charged at claim, so this
+ * only releases the reservation or blocks at the attempt cap -- it never
+ * re-charges, and it never touches a task owned by a newer dispatch.
+ */
+export function exitAttempt(cwd: string, taskId: string, options: ExitAttemptOptions = {}): ExitAttemptResult {
+  let outcome: ExitAttemptResult["outcome"] = "changed";
+  const updated = mutateTask(cwd, taskId, task => {
+    if (options.dispatchToken !== undefined) {
+      if (task.dispatch_token !== options.dispatchToken) return null;
+    } else if (options.owner !== undefined) {
+      if (task.assigned_to !== options.owner) return null;
+    }
+    if (task.status === "todo") {
+      if (!task.dispatch_token) return null;
+    } else if (task.status !== "in_progress") {
+      return null;
+    }
+
+    const maxAttempts = options.maxAttempts ?? Number.POSITIVE_INFINITY;
+    if ((task.attempt_count ?? 0) >= maxAttempts) {
+      outcome = "blocked";
+      return {
+        status: "blocked",
+        blocked_reason: `Max attempts (${maxAttempts}) reached`,
+        assigned_to: undefined,
+        dispatch_token: undefined,
+      };
+    }
+    outcome = "todo";
+    return { status: "todo", assigned_to: undefined, dispatch_token: undefined };
+  });
+
+  if (updated) return { outcome, task: updated };
+  return { outcome: getTask(cwd, taskId) ? "changed" : "missing", task: null };
+}
+
+// =============================================================================
+// Review application (single guarded mutation)
+// =============================================================================
+
+export interface ReviewAttribution {
+  /** Status observed when the review started. */
+  status: TaskStatus;
+  /** For done tasks: the completion's dispatch attribution. */
+  dispatchToken?: string;
+  /** Fallback attribution for tokenless (lobby/manual) completions. */
+  owner?: string;
+}
+
+/**
+ * Persist review feedback, review_count and the verdict's status change in a
+ * single guarded mutation. Feedback computed by a reviewer is discarded when
+ * the task is no longer done by the dispatch that was reviewed.
+ */
+export function applyReview(
+  cwd: string,
+  taskId: string,
+  feedback: ReviewFeedback,
+  attribution: ReviewAttribution,
+): Task | null {
+  return mutateTask(cwd, taskId, task => {
+    if (task.status !== attribution.status) return null;
+
+    if (task.status === "done") {
+      if (attribution.dispatchToken !== undefined) {
+        if (task.completed_dispatch !== attribution.dispatchToken) return null;
+      } else if (attribution.owner !== undefined && task.completed_by !== attribution.owner) {
+        return null;
+      }
+    } else if (task.status === "in_progress") {
+      if (attribution.dispatchToken !== undefined && task.dispatch_token !== attribution.dispatchToken) return null;
+      if (attribution.owner !== undefined && task.assigned_to !== attribution.owner) return null;
+    }
+
+    const updates: Partial<Task> = {
+      last_review: feedback,
+      review_count: (task.review_count ?? 0) + 1,
+    };
+
+    if (task.status === "done") {
+      if (feedback.verdict === "NEEDS_WORK") {
+        Object.assign(updates, { status: "todo", ...REOPEN_CLEARS });
+      } else if (feedback.verdict === "MAJOR_RETHINK") {
+        const summary = feedback.summary.split("\n")[0].slice(0, 120);
+        Object.assign(updates, {
+          status: "blocked",
+          blocked_reason: `Reviewer: ${summary || "Major issues found"}`,
+          assigned_to: undefined,
+          dispatch_token: undefined,
+        });
+      }
+    }
+
+    return updates;
+  });
+}
+
 // =============================================================================
 // Ready Tasks (Dependency Resolution)
 // =============================================================================
 
+/** A todo task carrying a dispatch token is reserved: not ready to launch. */
+function isDispatchable(task: Task): boolean {
+  return task.status === "todo" && !task.dispatch_token;
+}
+
 export function getReadyTasksFrom(tasks: Task[], options?: { advisory?: boolean }): Task[] {
   if (options?.advisory) {
-    return tasks.filter(t => t.status === "todo" && !t.milestone);
+    return tasks.filter(t => isDispatchable(t) && !t.milestone);
   }
   const doneIds = new Set(tasks.filter(t => t.status === "done").map(t => t.id));
 
   return tasks.filter(task => {
-    if (task.status !== "todo" || task.milestone) return false;
+    if (!isDispatchable(task) || task.milestone) return false;
     return task.depends_on.every(depId => doneIds.has(depId));
   });
 }
@@ -626,17 +1037,18 @@ export function autoCompleteMilestones(cwd: string): void {
     changed = false;
     const tasks = getTasks(cwd);
     for (const task of tasks) {
-      if (!task.milestone || task.status !== "todo") continue;
-      const allDepsDone = task.depends_on.every(depId => {
-        const dep = getTask(cwd, depId);
-        return dep?.status === "done";
-      });
-      if (allDepsDone) {
-        updateTask(cwd, task.id, {
+      if (!task.milestone || !isDispatchable(task)) continue;
+      const completed = mutateTask(cwd, task.id, current => {
+        if (!current.milestone || !isDispatchable(current)) return null;
+        const allDepsDone = current.depends_on.every(depId => getTask(cwd, depId)?.status === "done");
+        if (!allDepsDone) return null;
+        return {
           status: "done",
           completed_at: new Date().toISOString(),
           summary: "All subtasks completed",
-        });
+        };
+      });
+      if (completed) {
         const doneCount = getTasks(cwd).filter(t => t.status === "done").length;
         const plan = getPlan(cwd);
         if (plan) updatePlan(cwd, { completed_count: doneCount });

@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Dirs } from "../../lib.ts";
 import { generateMemorableName } from "../../lib.ts";
-import type { CrewParams, AppendEntryFn } from "../types.ts";
+import type { CrewParams, AppendEntryFn, ReviewFeedback } from "../types.ts";
 import { result } from "../utils/result.ts";
 import { resolveModel, spawnAgents } from "../agents.ts";
 import { loadCrewConfig } from "../utils/config.ts";
@@ -78,10 +78,7 @@ export async function execute(
     } else if (teamStore.taskPendingApproval(task)) {
       needsApproval.push(task);
     } else if (task.attempt_count >= config.work.maxAttemptsPerTask) {
-      store.updateTask(cwd, task.id, {
-        status: "blocked",
-        blocked_reason: `Max attempts (${config.work.maxAttemptsPerTask}) reached`,
-      });
+      store.blockTask(cwd, task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`);
       store.appendTaskProgress(cwd, task.id, "system",
         `Auto-blocked after ${task.attempt_count} attempts (max: ${config.work.maxAttemptsPerTask})`);
       logFeedEvent(cwd, "crew", "task.block", task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`);
@@ -152,20 +149,31 @@ export async function execute(
     const task = readyTasks.find(t => !lobbyAssigned.has(t.id));
     if (!task) break;
 
+    // A lobby claim is a dispatch: it reserves the task, charges the attempt
+    // and is released again if delivery to the worker fails.
+    const claimed = store.claimTaskForDispatch(cwd, task.id, lobbyWorker.name, {
+      maxAttempts: config.work.maxAttemptsPerTask,
+    });
+    if (!claimed || !claimed.dispatch_token) continue;
+    const dispatchToken = claimed.dispatch_token;
+
     const others = readyTasks.filter(t => t.id !== task.id);
     const prompt = buildWorkerPrompt(task, prdLabel, cwd, config, others, skills, teamStore.buildTeamPromptContext(cwd, task));
-    store.updateTask(cwd, task.id, {
-      status: "in_progress",
-      started_at: new Date().toISOString(),
-      base_commit: store.getBaseCommit(cwd),
-      assigned_to: lobbyWorker.name,
-      attempt_count: task.attempt_count + 1,
-    });
-    if (!assignTaskToLobbyWorker(lobbyWorker, task.id, prompt, dirs.inbox)) {
-      store.updateTask(cwd, task.id, { status: "todo", assigned_to: undefined });
+    const baseCommit = store.getBaseCommit(cwd); // git outside the guard
+    const started = store.startTask(cwd, task.id, lobbyWorker.name, { baseCommit, dispatchToken });
+    if (!started) {
+      store.releaseDispatch(cwd, task.id, dispatchToken);
       continue;
     }
-    store.appendTaskProgress(cwd, task.id, "system", `Assigned to lobby worker ${lobbyWorker.name} (attempt ${task.attempt_count + 1})`);
+    if (!assignTaskToLobbyWorker(lobbyWorker, task.id, prompt, dirs.inbox)) {
+      store.exitAttempt(cwd, task.id, {
+        owner: lobbyWorker.name,
+        dispatchToken,
+        maxAttempts: config.work.maxAttemptsPerTask,
+      });
+      continue;
+    }
+    store.appendTaskProgress(cwd, task.id, "system", `Assigned to lobby worker ${lobbyWorker.name} (attempt ${claimed.attempt_count})`);
     logFeedEvent(cwd, lobbyWorker.name, "task.start", task.id, task.title);
     lobbyAssigned.add(task.id);
   }
@@ -219,7 +227,7 @@ export async function execute(
   // reported them. Only these enter auto-review; a different worker's done
   // record is still reported but must not be reset/blocked by this receipt's
   // asynchronous review verdict.
-  const reviewable = new Map<string, string>();
+  const reviewable = new Map<string, { owner?: string; token?: string }>();
 
   // A worker that exited without clean task.done bookkeeping: its work may
   // have landed on disk. Use the snapshot taken under the ownership fence for
@@ -249,56 +257,25 @@ export async function execute(
 
   type ResetOutcome = "blocked" | "todo" | "missing" | "changed";
 
-  // Reset a task whose in_progress worker exited. The attempt for an
-  // in_progress task was already consumed by the worker's task.start. The
-  // status/owner/attempt check and the write happen under the store's
-  // per-task lock, so a concurrent task.start cannot be clobbered.
-  const resetInterruptedTask = (taskId: string, task: { attempt_count?: number } | undefined, owner: string | undefined): ResetOutcome => {
-    if (!task) return "missing";
-    const updated = store.mutateTask(cwd, taskId, current => {
-      if (current.status !== "in_progress" || current.assigned_to !== owner) return null;
-      if ((current.attempt_count ?? 0) >= config.work.maxAttemptsPerTask) {
-        return {
-          status: "blocked",
-          blocked_reason: `Max attempts (${config.work.maxAttemptsPerTask}) reached`,
-          assigned_to: undefined,
-        };
-      }
-      return { status: "todo", assigned_to: undefined };
+  // Release a task whose worker exited without finishing. The attempt was
+  // already charged by the dispatch claim, so the shared guarded exit only
+  // returns the reservation to todo or blocks at the cap: it never re-charges,
+  // and it never touches a task owned by a newer dispatch. Both the receipt
+  // paths below and the lobby close handler use this same mutation.
+  const exitOwnedAttempt = (
+    taskId: string,
+    owner: string | undefined,
+    dispatchToken: string | undefined,
+  ): ResetOutcome => {
+    const result = store.exitAttempt(cwd, taskId, {
+      owner,
+      dispatchToken,
+      maxAttempts: config.work.maxAttemptsPerTask,
     });
-    if (!updated) return store.getTask(cwd, taskId) ? "changed" : "missing";
-    if (updated.status === "blocked") {
+    if (result.outcome === "blocked") {
       logFeedEvent(cwd, "crew", "task.block", taskId, "Max attempts reached after worker exit");
-      return "blocked";
     }
-    return "todo";
-  };
-
-  // Reset a task the worker exited BEFORE claiming (task.start never ran):
-  // attempt_count was never persisted on the spawnAgents dispatch path, so
-  // consume an attempt here or the maxAttemptsPerTask backstop is bypassed
-  // and autonomous retries are bounded only by maxWaves.
-  const resetNeverStartedTask = (taskId: string, task: { attempt_count?: number } | undefined, owner: string | undefined): ResetOutcome => {
-    if (!task) return "missing";
-    const updated = store.mutateTask(cwd, taskId, current => {
-      if (current.status !== "todo" || current.assigned_to !== owner) return null;
-      const nextAttempt = (current.attempt_count ?? 0) + 1;
-      if (nextAttempt > config.work.maxAttemptsPerTask) {
-        return {
-          status: "blocked",
-          blocked_reason: `Max attempts (${config.work.maxAttemptsPerTask}) reached`,
-          assigned_to: undefined,
-          attempt_count: nextAttempt,
-        };
-      }
-      return { status: "todo", assigned_to: undefined, attempt_count: nextAttempt };
-    });
-    if (!updated) return store.getTask(cwd, taskId) ? "changed" : "missing";
-    if (updated.status === "blocked") {
-      logFeedEvent(cwd, "crew", "task.block", taskId, "Max attempts reached after worker exit");
-      return "blocked";
-    }
-    return "todo";
+    return result.outcome;
   };
 
   for (let i = 0; i < workerResults.length; i++) {
@@ -321,32 +298,46 @@ export async function execute(
     // Ownership fence: a receipt can arrive after a later wave has re-claimed
     // and started the task. Mutating on status alone would reset or block the
     // new owner's in_progress task and orphan its work. The receipt carries
-    // the per-dispatch workerName (recorded as assigned_to at launch and by
-    // task.start); a mismatch leaves the task entirely untouched. Done/blocked
-    // tasks have already had assigned_to cleared by their worker, so they are
-    // not mutable here and are classified as before. The unique per-dispatch
-    // suffix makes this fence valid even when two waves draw the same
-    // memorable adjective+noun pair.
+    // the dispatch token minted at its launch; a mismatch leaves the task
+    // entirely untouched. The per-dispatch workerName (recorded as assigned_to
+    // at launch and by task.start) is the fallback for tokenless dispatches
+    // such as lobby assignments. Done/blocked tasks have already had
+    // assigned_to cleared by their worker, so they are not mutable here and
+    // are classified as before.
     const receiptOwner = r.workerName;
+    const receiptToken = r.dispatchToken;
     if (task && (task.status === "todo" || task.status === "in_progress")) {
-      if (!receiptOwner) {
+      if (receiptToken) {
+        if (task.dispatch_token !== receiptToken) {
+          store.appendTaskProgress(cwd, taskId, "system",
+            `Ignored stale result from dispatch ${receiptToken.slice(0, 8)}: task holds a different reservation (status ${task.status}${task.assigned_to ? `, assigned to ${task.assigned_to}` : ""}); left untouched.`);
+          continue;
+        }
+      } else if (!receiptOwner) {
         store.appendTaskProgress(cwd, taskId, "system",
           `Ignored unattributable result from ${r.agent}: receipt carries no worker identity (task status ${task.status}, assigned to ${task.assigned_to ?? "no worker"}).`);
         continue;
-      }
-      if (task.assigned_to !== receiptOwner) {
+      } else if (task.assigned_to !== receiptOwner) {
         store.appendTaskProgress(cwd, taskId, "system",
           `Ignored stale result from ${receiptOwner}: task is currently assigned to ${task.assigned_to ?? "no worker"} (status ${task.status}).`);
         continue;
       }
     }
 
+    // Review attribution: a tokenless completion (lobby/manual) is attributed
+    // by its recorded completer.
+    const markReviewable = () => {
+      if (!task || task.status !== "done") return;
+      if (!receiptToken && !receiptOwner) return;
+      if (receiptToken ? task.completed_dispatch === receiptToken : task.completed_by === receiptOwner) {
+        reviewable.set(taskId, { owner: receiptOwner, token: receiptToken });
+      }
+    };
+
     if (r.exitCode === 0) {
       if (task?.status === "done") {
         succeeded.push(taskId);
-        if (receiptOwner && task.completed_by === receiptOwner) {
-          reviewable.set(taskId, receiptOwner);
-        }
+        markReviewable();
       } else if (task?.status === "blocked") {
         blocked.push(taskId);
       } else if (task?.status === "in_progress") {
@@ -354,7 +345,7 @@ export async function execute(
         // including the final allowed attempt that is about to be blocked.
         appendIndeterminateNote(taskId, task,
           r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
-        const outcome = resetInterruptedTask(taskId, task, receiptOwner);
+        const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
         if (outcome === "blocked") {
           blocked.push(taskId);
         } else if (outcome === "todo") {
@@ -365,7 +356,7 @@ export async function execute(
       } else if (task?.status === "todo") {
         appendNeverStartedNote(taskId, task,
           r.wasGracefullyShutdown ? "Graceful shutdown." : "Worker exited with code 0 without task.done.");
-        const outcome = resetNeverStartedTask(taskId, task, receiptOwner);
+        const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
         if (outcome === "blocked") {
           blocked.push(taskId);
         } else if (outcome === "todo") {
@@ -380,14 +371,12 @@ export async function execute(
       if (r.wasGracefullyShutdown) {
         if (task?.status === "done") {
           succeeded.push(taskId);
-          if (receiptOwner && task.completed_by === receiptOwner) {
-            reviewable.set(taskId, receiptOwner);
-          }
+          markReviewable();
         } else if (task?.status === "blocked") {
           blocked.push(taskId);
         } else if (task?.status === "in_progress") {
           appendIndeterminateNote(taskId, task, "Graceful shutdown.");
-          const outcome = resetInterruptedTask(taskId, task, receiptOwner);
+          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
           if (outcome === "blocked") {
             blocked.push(taskId);
           } else if (outcome === "todo") {
@@ -397,7 +386,7 @@ export async function execute(
           }
         } else if (task?.status === "todo") {
           appendNeverStartedNote(taskId, task, "Graceful shutdown.");
-          const outcome = resetNeverStartedTask(taskId, task, receiptOwner);
+          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
           if (outcome === "blocked") {
             blocked.push(taskId);
           } else if (outcome === "todo") {
@@ -412,7 +401,10 @@ export async function execute(
         store.appendTaskProgress(cwd, taskId, "system", `Worker crashed: ${r.error ?? "Unknown error"}`);
         // The task is blocked, but the worker may still have landed work.
         appendIndeterminateNote(taskId, task, `Worker crashed: ${r.error ?? "Unknown error"}`);
-        store.blockTask(cwd, taskId, `Worker failed: ${r.error ?? "Unknown error"}`);
+        store.blockTask(cwd, taskId, `Worker failed: ${r.error ?? "Unknown error"}`, {
+          owner: receiptOwner,
+          dispatchToken: receiptToken,
+        });
         blocked.push(taskId);
       } else {
         if (task?.status === "in_progress") {
@@ -422,7 +414,7 @@ export async function execute(
           appendIndeterminateNote(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
           // Non-autonomous: previously left stuck in_progress forever; reset so
           // the next wave can retry (or block at max attempts).
-          const outcome = resetInterruptedTask(taskId, task, receiptOwner);
+          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
           if (outcome === "blocked") {
             blocked.push(taskId);
             continue;
@@ -438,7 +430,7 @@ export async function execute(
           // never by maxAttemptsPerTask. Record the distinct never-started
           // wording even when this attempt exhausts the budget.
           appendNeverStartedNote(taskId, task, `Worker failed: ${r.error ?? "Unknown error"}`);
-          const outcome = resetNeverStartedTask(taskId, task, receiptOwner);
+          const outcome = exitOwnedAttempt(taskId, receiptOwner, receiptToken);
           if (outcome === "blocked") {
             blocked.push(taskId);
             continue;
@@ -455,19 +447,22 @@ export async function execute(
   }
 
   // Auto-review succeeded tasks. Only completions attributable to the
-  // receipt's own unique dispatch identity enter this loop: a slower wave's
-  // exit-0 receipt may arrive after another worker already completed the
-  // task, and its review verdict must not reset/block that worker's record.
+  // receipt's own dispatch enter this loop: a slower wave's exit-0 receipt may
+  // arrive after another worker already completed the task, and its review
+  // verdict must not reset/block that worker's record.
   if (config.review.enabled && reviewable.size > 0) {
     const hasReviewer = availableAgents.some(a => a.name === "crew-reviewer");
     if (hasReviewer) {
       for (const taskId of [...succeeded]) {
         if (signal?.aborted) break;
-        const reviewOwner = reviewable.get(taskId);
-        if (!reviewOwner) continue;
+        const attribution = reviewable.get(taskId);
+        if (!attribution) continue;
         const task = store.getTask(cwd, taskId);
         if (!task || !task.base_commit) continue;
-        if (task.completed_by !== reviewOwner) continue;
+        const stillAttributed = attribution.token !== undefined
+          ? task.completed_dispatch === attribution.token
+          : task.completed_by === attribution.owner;
+        if (!stillAttributed) continue;
         if ((task.review_count ?? 0) >= config.review.maxIterations) continue;
 
         if (task.status === "blocked" || /duplicate/i.test(task.blocked_reason ?? "")) {
@@ -481,41 +476,38 @@ export async function execute(
           continue;
         }
 
+        // The reviewer only computes feedback; reviewImplementation no longer
+        // persists last_review. The verdict is applied below in one guarded
+        // mutation, so a completion that changed while the reviewer ran is
+        // discarded instead of being reset/blocked.
         const rr = await reviewImplementation(cwd, taskId, config.models?.reviewer ?? sessionModel);
-        const verdict = rr.details?.verdict as string | undefined;
-        if (!verdict) {
+        const feedback = rr.details?.feedback as ReviewFeedback | undefined;
+        const verdict = feedback?.verdict;
+        if (!feedback || !verdict) {
           store.appendTaskProgress(cwd, taskId, "system",
             `Auto-review skipped: ${rr.details?.error ?? "unknown"}`);
           continue;
         }
 
-        // Review is asynchronous: re-read before applying the verdict. If the
-        // task was re-completed/reset by another identity while the reviewer
-        // ran, this wave no longer owns the completion.
-        const reviewed = store.getTask(cwd, taskId);
-        if (!reviewed || reviewed.status !== "done" || reviewed.completed_by !== reviewOwner) {
+        const applied = store.applyReview(cwd, taskId, feedback, {
+          status: "done",
+          dispatchToken: attribution.token,
+          owner: attribution.owner,
+        });
+        if (!applied) {
           store.appendTaskProgress(cwd, taskId, "system",
-            `Auto-review result (${verdict}) discarded: completion is no longer attributed to ${reviewOwner}.`);
+            `Auto-review result (${verdict}) discarded: completion is no longer attributed to ${attribution.owner ?? attribution.token ?? "this dispatch"}.`);
           logFeedEvent(cwd, "crew", "task.review", taskId, "skipped — completion changed");
           continue;
         }
 
-        const reviewCount = (reviewed.review_count ?? 0) + 1;
-        store.updateTask(cwd, taskId, { review_count: reviewCount });
-
         if (verdict === "SHIP") {
           logFeedEvent(cwd, "crew", "task.review", taskId, "SHIP");
         } else if (verdict === "NEEDS_WORK") {
-          store.resetTask(cwd, taskId);
           logFeedEvent(cwd, "crew", "task.review", taskId, "NEEDS_WORK — reset for retry");
           succeeded.splice(succeeded.indexOf(taskId), 1);
           failed.push(taskId);
         } else {
-          const lastReview = store.getTask(cwd, taskId)?.last_review;
-          const summary = lastReview?.summary
-            ? lastReview.summary.split("\n")[0].slice(0, 120)
-            : "Major issues found";
-          store.blockTask(cwd, taskId, `Reviewer: ${summary}`);
           logFeedEvent(cwd, "crew", "task.review", taskId, "MAJOR_RETHINK — blocked");
           succeeded.splice(succeeded.indexOf(taskId), 1);
           blocked.push(taskId);

@@ -71,6 +71,14 @@ export interface Task {
   attempt_count: number;         // How many times attempted (for auto-block)
   review_count?: number;         // How many times reviewed
   last_review?: ReviewFeedback;  // Feedback from last review (for retry)
+  /** Live dispatch reservation. Present only while a claim is outstanding. */
+  dispatch_token?: string;
+  /** Dispatch token that produced the current completion (review attribution). */
+  completed_dispatch?: string;
+  /** Monotonic document revision, bumped by every guarded task write. */
+  rev?: number;
+  /** Spec generation, bumped on every spec edit (stale-edit precondition). */
+  generation?: number;
 }
 
 export interface ReviewFeedback {
@@ -170,6 +178,8 @@ export interface AgentTask {
   maxOutput?: MaxOutputConfig;
   /** Runtime worker identity; becomes PI_AGENT_NAME and the task's assigned_to. */
   workerName?: string;
+  /** Dispatch reservation to start; minted at the launch point when omitted. */
+  dispatchToken?: string;
 }
 
 export interface AgentResult {
@@ -182,6 +192,8 @@ export interface AgentResult {
   taskId?: string;
   /** Runtime worker identity (PI_AGENT_NAME) used to fence stale receipts. */
   workerName?: string;
+  /** Dispatch token reserved for this launch (fences its receipts). */
+  dispatchToken?: string;
   /** Dispatch was abandoned because the task was no longer claimable. */
   skipped?: boolean;
   wasGracefullyShutdown?: boolean;

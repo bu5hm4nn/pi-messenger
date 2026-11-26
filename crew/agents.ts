@@ -196,33 +196,56 @@ async function runAgent(
 
   // Persist dispatch ownership at the actual launch point, not while the wave
   // queue is built: a task cancelled before this line must keep no assignee.
-  // claimTaskForDispatch re-reads under the per-task lock; if another process
+  // claimTaskForDispatch re-reads under the per-task guard; if another process
   // claimed it first, skip this launch instead of spawning a duplicate worker.
+  let dispatchToken: string | undefined;
   if (task.workerName && task.taskId) {
     const current = crewStore.getTask(cwd, task.taskId);
-    if (current) {
-      const claimed = crewStore.claimTaskForDispatch(cwd, task.taskId, workerName);
-      if (!claimed) {
-        const now = crewStore.getTask(cwd, task.taskId);
-        const reason = `Dispatch skipped: ${task.taskId} is ${now?.status ?? "unknown"}, not todo`;
-        progress.status = "failed";
-        progress.error = reason;
-        progress.durationMs = Date.now() - startTime;
-        return {
-          agent: task.agent,
-          exitCode: 1,
-          output: "",
-          truncated: false,
-          progress,
-          taskId: task.taskId,
-          workerName,
-          skipped: true,
-          error: reason,
-        };
-      }
-      crewStore.appendTaskProgress(cwd, task.taskId, "system",
-        `Assigned to ${task.agent} ${workerName}`);
+    if (!current) {
+      // Missing task at launch: never spawn a worker for a task file that no
+      // longer exists (it would write bookkeeping for a ghost).
+      const reason = `Dispatch skipped: ${task.taskId} no longer exists`;
+      progress.status = "failed";
+      progress.error = reason;
+      progress.durationMs = Date.now() - startTime;
+      return {
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        taskId: task.taskId,
+        workerName,
+        skipped: true,
+        error: reason,
+      };
     }
+    const claimed = crewStore.claimTaskForDispatch(cwd, task.taskId, workerName, {
+      maxAttempts: config.work.maxAttemptsPerTask,
+    });
+    if (!claimed) {
+      const now = crewStore.getTask(cwd, task.taskId);
+      const reason = now?.dispatch_token
+        ? `Dispatch skipped: ${task.taskId} is reserved for another dispatch`
+        : `Dispatch skipped: ${task.taskId} is ${now?.status ?? "unknown"}, not todo (or out of attempts)`;
+      progress.status = "failed";
+      progress.error = reason;
+      progress.durationMs = Date.now() - startTime;
+      return {
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        taskId: task.taskId,
+        workerName,
+        skipped: true,
+        error: reason,
+      };
+    }
+    dispatchToken = claimed.dispatch_token;
+    crewStore.appendTaskProgress(cwd, task.taskId, "system",
+      `Assigned to ${task.agent} ${workerName}`);
   }
 
   const role = agentConfig?.crewRole ?? "worker";
@@ -302,15 +325,44 @@ async function runAgent(
     // assigned_to the receipt carries.
     if (task.workerName) workerFlag.PI_AGENT_NAME = task.workerName;
     else if (role === "worker") workerFlag.PI_AGENT_NAME = workerName;
+    // The reservation token is attached by the extension, never copied by the
+    // model: task.start/task.done read it from the environment.
+    if (dispatchToken) workerFlag.PI_CREW_DISPATCH = dispatchToken;
     const env = Object.keys(envOverrides).length > 0 || Object.keys(workerFlag).length > 0
       ? { ...process.env, ...envOverrides, ...workerFlag }
       : undefined;
 
-    const proc = spawn(getPiCommand(), args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      ...(env ? { env } : {}),
-    });
+    let proc;
+    try {
+      proc = spawn(getPiCommand(), args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(env ? { env } : {}),
+      });
+    } catch (err) {
+      // Launch failed after the claim: release the reservation so the task is
+      // dispatchable again (only if the token still matches).
+      if (dispatchToken && task.taskId) {
+        try { crewStore.releaseDispatch(cwd, task.taskId, dispatchToken); } catch {}
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      progress.status = "failed";
+      progress.error = message;
+      progress.durationMs = Date.now() - startTime;
+      resolve({
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        config: agentConfig,
+        taskId: task.taskId,
+        workerName,
+        dispatchToken,
+        error: message,
+      });
+      return;
+    }
     if (task.taskId) {
       registerWorker({ type: "worker", proc, name: workerName, cwd, taskId: task.taskId });
     }
@@ -405,6 +457,7 @@ async function runAgent(
         config: agentConfig,
         taskId: task.taskId,
         workerName,
+        dispatchToken,
         wasGracefullyShutdown: gracefulShutdownRequested,
         error: progress.error,
         artifactPaths: artifactPaths ? {

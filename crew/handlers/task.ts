@@ -243,32 +243,42 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
   const allTasks = store.getTasks(cwd);
   const subtaskIds = created.map(t => t.id);
   for (const t of allTasks) {
-    if (t.id !== id && t.depends_on.includes(id) && !subtaskIds.includes(t.id)) {
-      store.updateTask(cwd, t.id, {
-        depends_on: [...t.depends_on.filter(d => d !== id), ...subtaskIds],
-      });
-    }
+    if (t.id === id || !t.depends_on.includes(id) || subtaskIds.includes(t.id)) continue;
+    // The merge is computed from the dependency list read inside the
+    // dependent's mutation, so a dependency added after this snapshot survives.
+    store.mutateTask(cwd, t.id, current =>
+      current.depends_on.includes(id)
+        ? { depends_on: [...current.depends_on.filter(d => d !== id), ...subtaskIds] }
+        : null
+    );
   }
 
   if (task.status === "blocked") {
     store.cleanupBlockFiles(cwd, id);
   }
 
-  store.updateTask(cwd, id, {
-    depends_on: subtaskIds,
-    milestone: true,
-    status: "todo",
-    started_at: undefined,
-    completed_at: undefined,
-    base_commit: undefined,
-    assigned_to: undefined,
-    summary: undefined,
-    evidence: undefined,
-    completed_by: undefined,
-    blocked_reason: undefined,
-    role: undefined,
-    risk_labels: undefined,
-    approval: undefined,
+  // Split is a reopen + takeover: the guarded mutation re-checks that the task
+  // is still splittable and invalidates the dispatch/completion attribution.
+  store.mutateTask(cwd, id, current => {
+    if (current.status === "done" || current.milestone) return null;
+    return {
+      depends_on: subtaskIds,
+      milestone: true,
+      status: "todo",
+      started_at: undefined,
+      completed_at: undefined,
+      base_commit: undefined,
+      assigned_to: undefined,
+      summary: undefined,
+      evidence: undefined,
+      completed_by: undefined,
+      completed_dispatch: undefined,
+      dispatch_token: undefined,
+      blocked_reason: undefined,
+      role: undefined,
+      risk_labels: undefined,
+      approval: undefined,
+    };
   });
 
   store.setTaskSpec(cwd, id, `# ${task.title}\n\nMilestone: completes when ${subtaskIds.join(", ")} are done.\n`);
@@ -440,7 +450,11 @@ function taskStart(cwd: string, params: CrewParams, state: MessengerState) {
   }
 
   const agentName = state.agentName || "unknown";
-  const actionResult = executeTaskAction(cwd, "start", id, agentName);
+  // The dispatch token is attached by the spawning extension, never typed by
+  // the model: it fences this start to the reservation that launched it.
+  const actionResult = executeTaskAction(cwd, "start", id, agentName, undefined, {
+    dispatchToken: process.env.PI_CREW_DISPATCH || undefined,
+  });
   if (!actionResult.success || !actionResult.task) {
     return result(`Error: ${actionResult.message}`, {
       mode: "task.start",
@@ -503,7 +517,9 @@ function taskDone(cwd: string, params: CrewParams, state: MessengerState) {
   const summary = params.summary ?? "Task completed";
   const evidence: TaskEvidence | undefined = params.evidence;
 
-  const completed = store.completeTask(cwd, id, summary, evidence, state.agentName || "unknown");
+  const completed = store.completeTask(cwd, id, summary, evidence, state.agentName || "unknown", {
+    dispatchToken: process.env.PI_CREW_DISPATCH || undefined,
+  });
   if (!completed) {
     return result(`Error: Failed to complete task ${id}`, { mode: "task.done", error: "complete_failed", id });
   }
@@ -736,14 +752,22 @@ function taskApproval(cwd: string, params: CrewParams, state: MessengerState, st
     });
   }
 
-  const approval = {
-    ...task.approval,
-    status,
-    feedback: params.reason,
-    decided_by: actor,
-    decided_at: new Date().toISOString(),
-  };
-  const updated = store.updateTask(cwd, id, { approval });
+  const decidedAt = new Date().toISOString();
+  // Spread the approval read inside the mutation, and re-check the same
+  // preconditions: approval may only change before work starts.
+  const updated = store.mutateTask(cwd, id, current => {
+    if (!current.approval?.required) return null;
+    if (current.status === "in_progress" || current.status === "done") return null;
+    return {
+      approval: {
+        ...current.approval,
+        status,
+        feedback: params.reason,
+        decided_by: actor,
+        decided_at: decidedAt,
+      },
+    };
+  });
   logFeedEvent(cwd, actor, status === "approved" ? "task.approve" : "task.reject", id, params.reason);
 
   const nextStep = status === "rejected"

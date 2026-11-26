@@ -149,6 +149,8 @@ Follow the output format in your instructions.`;
     );
 
     if (matchingTask && update.newContent) {
+      const current = store.getTask(cwd, matchingTask.id);
+      if (!current) continue;
       const currentSpec = store.getTaskSpec(cwd, matchingTask.id) ?? "";
       
       // Append update to spec (don't replace)
@@ -159,8 +161,13 @@ Follow the output format in your instructions.`;
 
 ${update.newContent}`;
 
-      store.setTaskSpec(cwd, matchingTask.id, updatedSpec);
-      updatedCount++;
+      // The append was computed outside the guard, so it carries the
+      // generation it was built from: a newer spec edit makes it stale and
+      // aborts instead of overwriting.
+      const applied = store.setTaskSpec(cwd, matchingTask.id, updatedSpec, {
+        expectedGeneration: current.generation ?? 0,
+      });
+      if (applied) updatedCount++;
     }
   }
 

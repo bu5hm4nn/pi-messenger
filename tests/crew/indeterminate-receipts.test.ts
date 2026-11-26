@@ -107,7 +107,7 @@ describe("crew/indeterminate receipts and crew idle", () => {
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
     // startTask inside the mock consumes the final attempt, so the
     // classification-time guard (attempt_count >= max) fires in resetInterruptedTask.
-    store.updateTask(dirs.cwd, task.id, { attempt_count: config.work.maxAttemptsPerTask - 1 });
+    store.mutateTask(dirs.cwd, task.id, () => ({ attempt_count: config.work.maxAttemptsPerTask - 1 }));
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
@@ -144,7 +144,7 @@ describe("crew/indeterminate receipts and crew idle", () => {
     writeWorkerAgent(dirs.cwd);
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
-    store.updateTask(dirs.cwd, task.id, { attempt_count: config.work.maxAttemptsPerTask - 1 });
+    store.mutateTask(dirs.cwd, task.id, () => ({ attempt_count: config.work.maxAttemptsPerTask - 1 }));
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
@@ -224,19 +224,22 @@ describe("crew/indeterminate receipts and crew idle", () => {
       return [makeResult(task.id, 0, { workerName: tasks[0]?.workerName })];
     });
 
-    // Wave 1: never-started exit consumes the single attempt (nextAttempt 1,
-    // 1 > 1 is false, so the task stays todo — the NEXT wave blocks).
+    // Wave 1: the claim charges the single allowed attempt, so the
+    // never-started exit releases the reservation and blocks at the cap.
     const wave1 = await workHandler.execute(
       { action: "work" },
       createDirs(dirs.cwd),
       createMockContext(dirs.cwd),
       () => {},
     );
-    expect(store.getTask(dirs.cwd, task.id)?.attempt_count).toBe(1);
-    expect(wave1.details.indeterminate ?? []).toEqual([task.id]);
+    const afterWave1 = store.getTask(dirs.cwd, task.id)!;
+    expect(afterWave1.attempt_count).toBe(1);
+    expect(afterWave1.status).toBe("blocked");
+    expect(wave1.details.blocked ?? []).toEqual([task.id]);
+    expect(wave1.details.indeterminate ?? []).toEqual([]);
 
-    // Wave 2: top-of-wave auto-block fires at attempt_count >= max; no extra
-    // worker dispatch happens.
+    // Wave 2: nothing is dispatched for a blocked task and the attempt budget
+    // is not charged again.
     const wave2 = await workHandler.execute(
       { action: "work" },
       createDirs(dirs.cwd),
@@ -272,9 +275,11 @@ describe("crew/indeterminate receipts and crew idle", () => {
       store.startTask(dirs.cwd, task.id, waveAWorker!);
       store.updateTask(dirs.cwd, task.id, { base_commit: "aaa1111" });
 
-      // Before A's receipt is classified, wave B re-claims and starts the task.
-      store.updateTask(dirs.cwd, task.id, { status: "todo", assigned_to: undefined });
-      store.startTask(dirs.cwd, task.id, "WaveBWorker");
+      // Before A's receipt is classified, wave B takes the task over (explicit
+      // reset clears A's reservation), re-claims and starts it.
+      store.resetTask(dirs.cwd, task.id);
+      const claimedB = store.claimTaskForDispatch(dirs.cwd, task.id, "WaveBWorker");
+      store.startTask(dirs.cwd, task.id, "WaveBWorker", { dispatchToken: claimedB?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "bbb2222" });
 
       return [makeResult(task.id, 1, { error: "wave A crashed", workerName: waveAWorker })];
@@ -327,7 +332,11 @@ describe("crew/indeterminate receipts and crew idle", () => {
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       waveAWorker = tasks[0]?.workerName;
       // Wave A never claimed the task; it is now owned by wave B's dispatch.
-      store.updateTask(dirs.cwd, task.id, { assigned_to: "WaveBWorker", attempt_count: 1 });
+      store.mutateTask(dirs.cwd, task.id, () => ({
+        assigned_to: "WaveBWorker",
+        attempt_count: 1,
+        dispatch_token: "wave-b-reservation",
+      }));
       return [makeResult(task.id, 1, { error: "wave A crashed before start", workerName: waveAWorker })];
     });
 
@@ -501,9 +510,9 @@ describe("crew/indeterminate receipts and crew idle", () => {
       // Wave B re-draws the same memorable name but has its own suffix.
       const waveBWorker = "SwiftArrow-bbbb";
       expect(waveBWorker.startsWith("SwiftArrow")).toBe(true);
-      store.updateTask(dirs.cwd, task.id, { status: "todo", assigned_to: undefined });
-      store.claimTaskForDispatch(dirs.cwd, task.id, waveBWorker);
-      store.startTask(dirs.cwd, task.id, waveBWorker);
+      store.resetTask(dirs.cwd, task.id);
+      const claimedB = store.claimTaskForDispatch(dirs.cwd, task.id, waveBWorker);
+      store.startTask(dirs.cwd, task.id, waveBWorker, { dispatchToken: claimedB?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "bbb2222" });
 
       // A's receipt arrives late. Equal display names must not let it pass.

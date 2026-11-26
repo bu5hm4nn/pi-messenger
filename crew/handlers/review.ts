@@ -7,7 +7,7 @@
 
 import { execSync } from "node:child_process";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { CrewParams } from "../types.ts";
+import type { CrewParams, ReviewFeedback, Task } from "../types.ts";
 import { result } from "../utils/result.ts";
 import { spawnAgents } from "../agents.ts";
 import { discoverCrewAgents } from "../utils/discover.ts";
@@ -54,7 +54,28 @@ export async function execute(
   const reviewType = type ?? (target.startsWith("task-") ? "impl" : "plan");
 
   if (reviewType === "impl") {
-    return reviewImplementation(cwd, target, reviewerModel);
+    const review = await reviewImplementation(cwd, target, reviewerModel);
+    const feedback = review.details?.feedback as ReviewFeedback | undefined;
+    if (!feedback) return review;
+
+    // The reviewer only computes feedback; applying it (feedback +
+    // review_count + verdict) is one guarded mutation that re-validates the
+    // attribution captured when the review started.
+    const applied = store.applyReview(cwd, target, feedback, {
+      status: review.details?.reviewedStatus as Task["status"],
+      dispatchToken: review.details?.reviewedDispatchToken as string | undefined,
+      owner: review.details?.reviewedOwner as string | undefined,
+    });
+    const shortSummary = feedback.summary.split("\n")[0].slice(0, 120);
+    store.appendTaskProgress(cwd, target, "system",
+      applied
+        ? `Review: ${feedback.verdict} — ${shortSummary}`
+        : `Review: ${feedback.verdict} — ${shortSummary} (not persisted: task changed during review)`);
+
+    return {
+      ...review,
+      details: { ...review.details, applied: applied !== null },
+    };
   } else {
     return reviewPlan(cwd, reviewerModel);
   }
@@ -144,22 +165,17 @@ Output your verdict as SHIP, NEEDS_WORK, or MAJOR_RETHINK with detailed feedback
     });
   }
 
-  // Parse verdict from output
+  // Parse verdict from output. Nothing is persisted here: the caller applies
+  // feedback + review_count + verdict in a single guarded mutation, so a task
+  // whose completion changed while the reviewer ran is not overwritten.
   const verdict: ParsedReview = parseVerdict(reviewResult.output);
-
-  // Store review feedback in task for retry context
-  store.updateTask(cwd, taskId, {
-    last_review: {
-      verdict: verdict.verdict,
-      summary: verdict.summary,
-      issues: verdict.issues,
-      suggestions: verdict.suggestions,
-      reviewed_at: new Date().toISOString()
-    }
-  });
-  const shortSummary = verdict.summary.split("\n")[0].slice(0, 120);
-  const progressMsg = `Review: ${verdict.verdict} — ${shortSummary}`;
-  store.appendTaskProgress(cwd, taskId, "system", progressMsg);
+  const feedback: ReviewFeedback = {
+    verdict: verdict.verdict,
+    summary: verdict.summary,
+    issues: verdict.issues,
+    suggestions: verdict.suggestions,
+    reviewed_at: new Date().toISOString(),
+  };
 
   const text = `# Review: ${taskId}
 
@@ -179,7 +195,13 @@ ${verdict.verdict === "SHIP" ? "✅ Ready to merge!" : verdict.verdict === "NEED
     taskId,
     verdict: verdict.verdict,
     issueCount: verdict.issues.length,
-    suggestionCount: verdict.suggestions.length
+    suggestionCount: verdict.suggestions.length,
+    feedback,
+    // Attribution captured before the reviewer ran; the caller re-checks it
+    // inside the guarded mutation.
+    reviewedStatus: task.status,
+    reviewedDispatchToken: task.completed_dispatch ?? task.dispatch_token,
+    reviewedOwner: task.completed_by ?? task.assigned_to,
   });
 }
 

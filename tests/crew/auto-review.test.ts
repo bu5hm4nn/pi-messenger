@@ -8,14 +8,14 @@ import type { ReviewFeedback, Task } from "../../crew/types.ts";
 
 function completedTask(cwd: string, title: string, deps: string[] = []): Task {
   const task = store.createTask(cwd, title, `Spec for ${title}`, deps);
-  store.updateTask(cwd, task.id, {
-    status: "in_progress",
-    started_at: new Date().toISOString(),
-    base_commit: "abc123",
-    assigned_to: "TestWorker",
-    attempt_count: 1,
+  // Claim + start + done is the lifecycle contract now; the claim charges the
+  // attempt and mints the dispatch token the completion is attributed to.
+  const claimed = store.claimTaskForDispatch(cwd, task.id, "TestWorker");
+  store.startTask(cwd, task.id, "TestWorker", {
+    baseCommit: "abc123",
+    dispatchToken: claimed?.dispatch_token,
   });
-  store.completeTask(cwd, task.id, "Done");
+  store.completeTask(cwd, task.id, "Done", undefined, "TestWorker");
   return store.getTask(cwd, task.id)!;
 }
 
@@ -181,9 +181,12 @@ describe("auto-review store operations", () => {
     const { cwd } = createTempCrewDirs();
     store.createPlan(cwd, "PRD.md");
     const task = store.createTask(cwd, "No git task", "Desc");
-    store.updateTask(cwd, task.id, { status: "done", completed_at: new Date().toISOString() });
+    const claimed = store.claimTaskForDispatch(cwd, task.id, "TestWorker");
+    store.startTask(cwd, task.id, "TestWorker", { dispatchToken: claimed?.dispatch_token });
+    store.completeTask(cwd, task.id, "Done", undefined, "TestWorker");
 
     const loaded = store.getTask(cwd, task.id)!;
+    expect(loaded.status).toBe("done");
     expect(loaded.base_commit).toBeUndefined();
   });
 });

@@ -164,6 +164,28 @@ export async function spawnAgents(
           results.push(result);
           running.splice(running.indexOf(promise), 1);
           options.onProgress?.(results);
+        })
+        .catch((error: unknown) => {
+          // Never let one launch rejection discard receipts from workers that
+          // already started: synthesize a per-task failure and keep draining.
+          const message = error instanceof Error ? error.message : String(error);
+          const timedOut = error instanceof crewStore.TaskLockTimeoutError;
+          const progress = createProgress(task.agent);
+          progress.status = "failed";
+          progress.error = message;
+          results.push({
+            agent: task.agent,
+            exitCode: 1,
+            output: "",
+            truncated: false,
+            progress,
+            taskId: task.taskId,
+            workerName: task.workerName ?? generateMemorableName(),
+            ...(timedOut ? { errorCode: "task_lock_timeout" } : {}),
+            error: message,
+          });
+          running.splice(running.indexOf(promise), 1);
+          options.onProgress?.(results);
         });
       running.push(promise);
     }
@@ -220,9 +242,31 @@ async function runAgent(
         error: reason,
       };
     }
-    const claimed = crewStore.claimTaskForDispatch(cwd, task.taskId, workerName, {
-      maxAttempts: config.work.maxAttemptsPerTask,
-    });
+    let claimed: Awaited<ReturnType<typeof crewStore.claimTaskForDispatch>>;
+    try {
+      claimed = crewStore.claimTaskForDispatch(cwd, task.taskId, workerName, {
+        maxAttempts: config.work.maxAttemptsPerTask,
+      });
+    } catch (err) {
+      if (!(err instanceof crewStore.TaskLockTimeoutError)) throw err;
+      // Typed per-task failure: this launch is rejected, but the batch keeps
+      // draining the workers that did launch.
+      const reason = `Dispatch claim timed out for ${task.taskId}: ${err.message}`;
+      progress.status = "failed";
+      progress.error = reason;
+      progress.durationMs = Date.now() - startTime;
+      return {
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        taskId: task.taskId,
+        workerName,
+        errorCode: "task_lock_timeout",
+        error: reason,
+      };
+    }
     if (!claimed) {
       const now = crewStore.getTask(cwd, task.taskId);
       const reason = now?.dispatch_token

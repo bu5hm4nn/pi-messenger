@@ -187,10 +187,10 @@ describe("crew/graceful shutdown", () => {
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       call++;
       const workerName = tasks[0]?.workerName!;
-      store.claimTaskForDispatch(dirs.cwd, tasks[0]?.taskId!, workerName);
+      const claimed = store.claimTaskForDispatch(dirs.cwd, tasks[0]?.taskId!, workerName);
       if (call === 1) {
-        store.startTask(dirs.cwd, t1.id, workerName);
-        store.completeTask(dirs.cwd, t1.id, "Done", undefined, workerName);
+        store.startTask(dirs.cwd, t1.id, workerName, { dispatchToken: claimed?.dispatch_token });
+        store.completeTask(dirs.cwd, t1.id, "Done", undefined, workerName, { dispatchToken: claimed?.dispatch_token });
         return [{
           agent: "crew-worker",
           exitCode: 1,
@@ -211,7 +211,7 @@ describe("crew/graceful shutdown", () => {
         }];
       }
 
-      store.startTask(dirs.cwd, t2.id, workerName);
+      store.startTask(dirs.cwd, t2.id, workerName, { dispatchToken: claimed?.dispatch_token });
       return [{
         agent: "crew-worker",
         exitCode: 1,
@@ -385,7 +385,7 @@ describe("crew/graceful shutdown", () => {
           // start records the owner, done records the attribution).
           const claimed = store.claimTaskForDispatch(dirs.cwd, t.taskId, "crew-worker");
           store.startTask(dirs.cwd, t.taskId, "crew-worker", { dispatchToken: claimed?.dispatch_token });
-          store.completeTask(dirs.cwd, t.taskId, "Done", undefined, "crew-worker");
+          store.completeTask(dirs.cwd, t.taskId, "Done", undefined, "crew-worker", { dispatchToken: claimed?.dispatch_token });
         }
       }
       return tasks.map(t => ({

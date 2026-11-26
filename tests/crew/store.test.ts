@@ -56,6 +56,33 @@ describe("crew/store", () => {
       expect(fs.existsSync(path.join(dirs.tasksDir, `${t2.id}.md`))).toBe(false);
     });
 
+    it("deletePlan skips a task whose guard is held, leaving its complete file set intact", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const heldTask = store.createTask(cwd, "Held task", "Desc");
+      const freeTask = store.createTask(cwd, "Free task", "Desc");
+      store.appendTaskProgress(cwd, heldTask.id, "WorkerA", "in flight");
+      store.blockTask(cwd, heldTask.id, "blocked for test");
+
+      const heldJson = path.join(dirs.tasksDir, `${heldTask.id}.json`);
+      const heldSpec = path.join(dirs.tasksDir, `${heldTask.id}.md`);
+      const heldProgress = path.join(dirs.tasksDir, `${heldTask.id}.progress.md`);
+      const heldBlock = path.join(dirs.blocksDir, `${heldTask.id}.md`);
+      const guard = store.acquireTaskGuard(cwd, heldTask.id);
+
+      try {
+        expect(store.deletePlan(cwd)).toBe(true);
+      } finally {
+        store.releaseTaskGuard(guard);
+      }
+
+      expect(fs.existsSync(heldJson)).toBe(true);
+      expect(fs.existsSync(heldSpec)).toBe(true);
+      expect(fs.existsSync(heldProgress)).toBe(true);
+      expect(fs.existsSync(heldBlock)).toBe(true);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${freeTask.id}.json`))).toBe(false);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${freeTask.id}.md`))).toBe(false);
+    });
+
     it("hasPlan returns false when no plan exists", () => {
       expect(store.hasPlan(cwd)).toBe(false);
       expect(store.getPlan(cwd)).toBeNull();
@@ -75,6 +102,21 @@ describe("crew/store", () => {
       expect(fs.existsSync(path.join(dirs.tasksDir, "task-1.md"))).toBe(true);
       expect(fs.existsSync(path.join(dirs.tasksDir, "task-2.json"))).toBe(true);
       expect(fs.existsSync(path.join(dirs.tasksDir, "task-2.md"))).toBe(true);
+    });
+
+    it("assigns monotonic IDs even when the highest task was deleted", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const t1 = store.createTask(cwd, "Task one", "Description one");
+      const t2 = store.createTask(cwd, "Task two", "Description two");
+
+      expect(store.deleteTask(cwd, t2.id)).toBe(true);
+
+      const t3 = store.createTask(cwd, "Task three", "Description three");
+      expect(t1.id).toBe("task-1");
+      expect(t2.id).toBe("task-2");
+      // The deleted highest ID must not come back with a fresh generation.
+      expect(t3.id).toBe("task-3");
+      expect(store.getTask(cwd, "task-2")).toBeNull();
     });
 
     it("getTasks sorts by numeric task ID (task-10 after task-9)", () => {
@@ -180,6 +222,26 @@ describe("crew/store", () => {
       store.setTaskSpec(cwd, task.id, "# Task one\n\nConcrete spec");
       const savedSpec = store.getTaskSpec(cwd, task.id);
       expect(savedSpec).toBe("# Task one\n\nConcrete spec");
+    });
+
+    it("concurrent spec edits: the loser's generation precondition fails without overwriting", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one");
+
+      // Both writers built their transform from generation 0.
+      const first = store.applyTaskRevision(cwd, task.id, { spec: "first edit" }, { expectedGeneration: 0 });
+      expect(first?.generation).toBe(1);
+      expect(store.getTaskSpec(cwd, task.id)).toBe("first edit");
+
+      expect(() => store.applyTaskRevision(
+        cwd,
+        task.id,
+        { spec: "stale second edit" },
+        { expectedGeneration: 0 },
+      )).toThrow(store.StaleTaskGenerationError);
+
+      expect(store.getTaskSpec(cwd, task.id)).toBe("first edit");
+      expect(store.getTask(cwd, task.id)?.generation).toBe(1);
     });
   });
 

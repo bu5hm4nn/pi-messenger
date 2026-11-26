@@ -108,6 +108,10 @@ function raceDir(dirs: TempCrewDirs): string {
   return fs.mkdtempSync(path.join(dirs.cwd, "guard-race-"));
 }
 
+async function waitForReady(dir: string, count: number): Promise<void> {
+  await waitFor(() => resultFiles(dir, "ready").length >= count, `${count} contender readiness handshake(s)`);
+}
+
 // =============================================================================
 // 1. exactly one concurrent acquire holds the guard
 // =============================================================================
@@ -121,7 +125,9 @@ describe("task guard mutual exclusion", () => {
 
     const first = startContender(["race", dirs.cwd, task.id, gate]);
     const second = startContender(["race", dirs.cwd, task.id, gate]);
-    // Barrier: both processes are already inside acquire when it appears.
+    // Handshake: both processes are already inside acquire when the barrier
+    // appears; the parent does not release `go` on a timer.
+    await waitForReady(gate, 2);
     fs.writeFileSync(path.join(gate, "go"), "");
     await Promise.all([waitForExit(first), waitForExit(second)]);
 
@@ -220,7 +226,7 @@ describe("task guard reclaim", () => {
     expect(fs.existsSync(guardPath)).toBe(false);
   });
 
-  it("two processes reclaiming a dead guard both eventually acquire; no live guard is swept", async () => {
+  it("two processes reclaiming a dead guard: exactly one unlink winner, and the successor survives the loser", async () => {
     const dirs = createTempCrewDirs();
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
@@ -231,16 +237,33 @@ describe("task guard reclaim", () => {
     const gate = raceDir(dirs);
     const first = startContender(["reclaim", dirs.cwd, task.id, gate]);
     const second = startContender(["reclaim", dirs.cwd, task.id, gate]);
+
+    // Both must observe the SAME dead marker before either may unlink it.
+    await waitForReady(gate, 2);
     fs.writeFileSync(path.join(gate, "go"), "");
+    await waitFor(() => resultFiles(gate, "observed").length === 2, "both contenders to observe the dead marker");
+    const observations = resultFiles(gate, "observed").map(name =>
+      readResult<{ markers: string[] }>(gate, name).markers
+    );
+    expect(observations).toEqual([[marker], [marker]]);
+
+    fs.writeFileSync(path.join(gate, "release"), "");
     await Promise.all([waitForExit(first), waitForExit(second)]);
 
-    // Both observed the dead guard and acquired in turn.
-    expect(resultFiles(gate, "held")).toHaveLength(2);
-    // At most one call can report the reclaim itself; the loser sees ENOENT or
-    // a successor's marker and retries acquisition.
+    // Exactly one process may win the unlink; a zero-winner run fails here.
     const reclaims = resultFiles(gate, "reclaim")
       .map(name => readResult<{ reclaimed: boolean }>(gate, name).reclaimed);
-    expect(reclaims.filter(Boolean).length).toBeLessThanOrEqual(1);
+    expect(reclaims.filter(Boolean)).toHaveLength(1);
+
+    // The loser proves the winner's successor marker survived and that a
+    // second reclaim attempt cannot remove it.
+    const successors = resultFiles(gate, "successor")
+      .map(name => readResult<{ markerPresent: boolean; reclaimedSuccessor: boolean }>(gate, name));
+    expect(successors).toHaveLength(1);
+    expect(successors[0].markerPresent).toBe(true);
+    expect(successors[0].reclaimedSuccessor).toBe(false);
+
+    expect(resultFiles(gate, "held")).toHaveLength(1);
     expect(fs.existsSync(path.join(guardPath, marker))).toBe(false);
     expect(fs.existsSync(guardPath)).toBe(false);
   });
@@ -278,6 +301,29 @@ describe("task guard reclaim", () => {
     expect(fs.existsSync(path.join(guardPath, marker))).toBe(true);
     expect(store.tryAcquireTaskGuard(dirs.cwd, task.id)).toBeNull();
   });
+
+  it("multi-marker and malformed guards are ALIVE: reclaim never unlinks from them", () => {
+    const dirs = createTempCrewDirs();
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+    const guardPath = store.getTaskGuardPath(dirs.cwd, task.id);
+
+    const deadA = markerFor(exitedPid());
+    const deadB = markerFor(exitedPid());
+    seedGuard(guardPath, deadA);
+    fs.writeFileSync(path.join(guardPath, deadB), JSON.stringify({ pid: "seeded" }));
+
+    expect(store.tryReclaimTaskGuard(dirs.cwd, task.id)).toBe(false);
+    expect(fs.existsSync(path.join(guardPath, deadA))).toBe(true);
+    expect(fs.existsSync(path.join(guardPath, deadB))).toBe(true);
+    expect(store.tryAcquireTaskGuard(dirs.cwd, task.id)).toBeNull();
+
+    fs.rmSync(guardPath, { recursive: true, force: true });
+    const malformed = "not-a-marker";
+    seedGuard(guardPath, malformed);
+    expect(store.tryReclaimTaskGuard(dirs.cwd, task.id)).toBe(false);
+    expect(fs.existsSync(path.join(guardPath, malformed))).toBe(true);
+  });
 });
 
 // =============================================================================
@@ -300,6 +346,8 @@ describe("pre-publish guard check", () => {
     })).toThrow(store.TaskLockLostError);
 
     expect(store.getTask(dirs.cwd, task.id)?.title).toBe("Task one");
+    // Stage-then-stat must clean up the aborted temp file as well.
+    expect(fs.readdirSync(dirs.tasksDir).filter(name => name.includes(".tmp-"))).toEqual([]);
     // Release must not touch anything after an ENOENT unlink, so the now-empty
     // guard stays and a later contender removes it when it acquires.
     expect(fs.existsSync(guardPath)).toBe(true);
@@ -457,7 +505,7 @@ describe("review application attribution", () => {
     const task = store.createTask(cwd, `Task ${owner}`, "Desc");
     const claimed = store.claimTaskForDispatch(cwd, task.id, owner)!;
     store.startTask(cwd, task.id, owner, { baseCommit: "abc123", dispatchToken: claimed.dispatch_token });
-    store.completeTask(cwd, task.id, "Done", undefined, owner);
+    store.completeTask(cwd, task.id, "Done", undefined, owner, { dispatchToken: claimed.dispatch_token });
     return { taskId: task.id, token: claimed.dispatch_token };
   }
 
@@ -512,13 +560,13 @@ describe("review application attribution", () => {
     const task = store.createTask(dirs.cwd, "Shared", "Desc");
     const a = store.claimTaskForDispatch(dirs.cwd, task.id, "WorkerA")!;
     store.startTask(dirs.cwd, task.id, "WorkerA", { dispatchToken: a.dispatch_token });
-    store.completeTask(dirs.cwd, task.id, "A landed", undefined, "WorkerA");
+    store.completeTask(dirs.cwd, task.id, "A landed", undefined, "WorkerA", { dispatchToken: a.dispatch_token });
 
     // B takes over and completes before A's review is applied.
     store.resetTask(dirs.cwd, task.id);
     const b = store.claimTaskForDispatch(dirs.cwd, task.id, "WorkerB")!;
     store.startTask(dirs.cwd, task.id, "WorkerB", { dispatchToken: b.dispatch_token });
-    store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB");
+    store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB", { dispatchToken: b.dispatch_token });
 
     expect(store.applyReview(dirs.cwd, task.id, feedback("NEEDS_WORK"), {
       status: "done",
@@ -547,15 +595,21 @@ describe("dependent list interleave", () => {
 
     const gate = raceDir(dirs);
     const holder = startContender(["hold", dirs.cwd, t2.id, gate, t3.id]);
+    const releaser = startContender(["release", dirs.cwd, t1.id, gate]);
+
+    // Both children acknowledge before the parent releases the start barrier.
+    await waitForReady(gate, 2);
+    fs.writeFileSync(path.join(gate, "go"), "");
 
     // Wait until the other process holds t2's guard inside its mutation.
     await waitFor(() => resultFiles(gate, "inside").length === 1, "contender to hold the guard");
 
-    // deleteTask snapshots dependents, then blocks on t2's guard. When it gets
-    // the guard the closure must read the updated list, not the snapshot.
+    // deleteTask snapshots dependents, then blocks on t2's guard. The releaser
+    // watches t1.json disappear (the unlink just before that block) and opens
+    // the release barrier; no fixed sleep decides the ordering.
     expect(store.deleteTask(dirs.cwd, t1.id)).toBe(true);
 
-    await waitForExit(holder);
+    await Promise.all([waitForExit(holder), waitForExit(releaser)]);
 
     const dependent = store.getTask(dirs.cwd, t2.id)!;
     expect(dependent.depends_on).toEqual([t3.id]);
@@ -605,6 +659,117 @@ describe("lifecycle mutation guards", () => {
     });
     expect(result.outcome).toBe("changed");
     expect(store.getTask(dirs.cwd, task.id)?.dispatch_token).toBe(claimed.dispatch_token);
+  });
+
+  it("exitAttempt requires BOTH owner and token when both are supplied", () => {
+    const dirs = createTempCrewDirs();
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Task one", "Desc one");
+    const claimed = store.claimTaskForDispatch(dirs.cwd, task.id, "WaveA")!;
+    store.startTask(dirs.cwd, task.id, "WaveA", { dispatchToken: claimed.dispatch_token });
+
+    // Correct token but the wrong owner must not release A's reservation.
+    const result = store.exitAttempt(dirs.cwd, task.id, {
+      owner: "WaveB",
+      dispatchToken: claimed.dispatch_token,
+      maxAttempts: 5,
+    });
+    expect(result.outcome).toBe("changed");
+    expect(store.getTask(dirs.cwd, task.id)?.dispatch_token).toBe(claimed.dispatch_token);
+    expect(store.getTask(dirs.cwd, task.id)?.assigned_to).toBe("WaveA");
+  });
+
+  it("stale worker token cannot block, unblock or reset a same-name successor's attempt", () => {
+    const dirs = createTempCrewDirs();
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Shared task", "Desc");
+
+    // Worker A's attempt, then a same-name worker B takes over with its own
+    // reservation; A's old token is now stale.
+    const stale = store.claimTaskForDispatch(dirs.cwd, task.id, "SameWorker")!;
+    store.startTask(dirs.cwd, task.id, "SameWorker", { dispatchToken: stale.dispatch_token });
+    store.resetTask(dirs.cwd, task.id);
+    const current = store.claimTaskForDispatch(dirs.cwd, task.id, "SameWorker")!;
+    store.startTask(dirs.cwd, task.id, "SameWorker", { dispatchToken: current.dispatch_token });
+
+    expect(store.blockTask(dirs.cwd, task.id, "stale block", {
+      dispatchToken: stale.dispatch_token,
+    })).toBeNull();
+    expect(store.resetTask(dirs.cwd, task.id, false, {
+      dispatchToken: stale.dispatch_token,
+    })).toEqual([]);
+
+    const after = store.getTask(dirs.cwd, task.id)!;
+    expect(after.status).toBe("in_progress");
+    expect(after.assigned_to).toBe("SameWorker");
+    expect(after.dispatch_token).toBe(current.dispatch_token);
+
+    // Unblock is likewise fenced for a worker carrying a stale token: it
+    // cannot resurrect a task another attempt already blocked.
+    const other = store.createTask(dirs.cwd, "Blocked task", "Desc");
+    const staleOther = store.claimTaskForDispatch(dirs.cwd, other.id, "SameWorker")!;
+    store.startTask(dirs.cwd, other.id, "SameWorker", { dispatchToken: staleOther.dispatch_token });
+    store.blockTask(dirs.cwd, other.id, "real blocker", { dispatchToken: staleOther.dispatch_token });
+    expect(store.unblockTask(dirs.cwd, other.id, {
+      dispatchToken: "stale-worker-token",
+    })).toBeNull();
+    expect(store.getTask(dirs.cwd, other.id)?.status).toBe("blocked");
+  });
+
+  it("worker handlers attach PI_CREW_DISPATCH so stale block/unblock/reset cannot touch a successor", async () => {
+    const dirs = createTempCrewDirs();
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Shared task", "Desc");
+    const stale = store.claimTaskForDispatch(dirs.cwd, task.id, "SameWorker")!;
+    store.startTask(dirs.cwd, task.id, "SameWorker", { dispatchToken: stale.dispatch_token });
+    store.resetTask(dirs.cwd, task.id);
+    const current = store.claimTaskForDispatch(dirs.cwd, task.id, "SameWorker")!;
+    store.startTask(dirs.cwd, task.id, "SameWorker", { dispatchToken: current.dispatch_token });
+
+    const blockedTask = store.createTask(dirs.cwd, "Blocked successor", "Desc");
+    const blockedClaim = store.claimTaskForDispatch(dirs.cwd, blockedTask.id, "SameWorker")!;
+    store.startTask(dirs.cwd, blockedTask.id, "SameWorker", { dispatchToken: blockedClaim.dispatch_token });
+    store.blockTask(dirs.cwd, blockedTask.id, "real blocker", { dispatchToken: blockedClaim.dispatch_token });
+
+    const taskHandler = await import("../../crew/handlers/task.ts");
+    const state = { agentName: "SameWorker" } as MessengerState;
+    process.env.PI_CREW_DISPATCH = stale.dispatch_token;
+
+    let blockResponse;
+    let resetResponse;
+    let unblockResponse;
+    try {
+      blockResponse = await taskHandler.execute(
+        "block",
+        { action: "task.block", id: task.id, reason: "stale block" },
+        state,
+        createMockContext(dirs.cwd),
+      );
+      resetResponse = await taskHandler.execute(
+        "reset",
+        { action: "task.reset", id: task.id },
+        state,
+        createMockContext(dirs.cwd),
+      );
+      unblockResponse = await taskHandler.execute(
+        "unblock",
+        { action: "task.unblock", id: blockedTask.id },
+        state,
+        createMockContext(dirs.cwd),
+      );
+    } finally {
+      delete process.env.PI_CREW_DISPATCH;
+    }
+
+    expect(blockResponse.details.error).toBe("block_failed");
+    expect(resetResponse.details.error).toBe("reset_failed");
+    expect(unblockResponse.details.error).toBe("unblock_failed");
+    const after = store.getTask(dirs.cwd, task.id)!;
+    expect(after.status).toBe("in_progress");
+    expect(after.dispatch_token).toBe(current.dispatch_token);
+    expect(after.assigned_to).toBe("SameWorker");
+    expect(store.getTask(dirs.cwd, blockedTask.id)?.status).toBe("blocked");
   });
 
   it("manual task.start mints a session token and charges the attempt once", () => {
@@ -661,17 +826,77 @@ describe("lifecycle mutation guards", () => {
     store.startTask(dirs.cwd, task.id, "WorkerA-1234", { dispatchToken: claimed.dispatch_token });
 
     const taskHandler = await import("../../crew/handlers/task.ts");
-    const response = await taskHandler.execute(
-      "done",
-      { action: "task.done", id: task.id, summary: "Done" },
-      { agentName: "WorkerA-1234" } as MessengerState,
-      createMockContext(dirs.cwd),
-    );
+    process.env.PI_CREW_DISPATCH = claimed.dispatch_token;
+    let response;
+    try {
+      response = await taskHandler.execute(
+        "done",
+        { action: "task.done", id: task.id, summary: "Done" },
+        { agentName: "WorkerA-1234" } as MessengerState,
+        createMockContext(dirs.cwd),
+      );
+    } finally {
+      delete process.env.PI_CREW_DISPATCH;
+    }
 
     expect(response.details.error).toBeUndefined();
     const after = store.getTask(dirs.cwd, task.id)!;
     expect(after.status).toBe("done");
     expect(after.completed_by).toBe("WorkerA-1234");
     expect(after.completed_dispatch).toBe(claimed.dispatch_token);
+  });
+});
+
+// =============================================================================
+// wave-start fences
+// =============================================================================
+
+describe("work wave-start auto-block fence", () => {
+  it("cap-block cannot clobber a reservation acquired after the ready-task scan", async () => {
+    const dirs = createTempCrewDirs();
+    writeWorkerAgent(dirs.cwd);
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const task = store.createTask(dirs.cwd, "Flaky task", "Desc");
+    store.mutateTask(dirs.cwd, task.id, () => ({ attempt_count: 5 }));
+
+    const agents = await import("../../crew/agents.ts");
+    const workHandler = await import("../../crew/handlers/work.ts");
+    const spawnSpy = vi.spyOn(agents, "spawnAgents").mockResolvedValue([]);
+
+    const originalBlock = store.blockTask.bind(store);
+    let claimed = false;
+    const blockSpy = vi.spyOn(store, "blockTask").mockImplementation(((
+      taskCwd: string,
+      taskId: string,
+      reason: string,
+      fence?: Parameters<typeof store.blockTask>[3],
+    ) => {
+      if (!claimed && taskId === task.id && fence?.expectedStatus === "todo") {
+        claimed = true;
+        // A dispatch claims the task between the wave scan and the auto-block.
+        store.claimTaskForDispatch(taskCwd, taskId, "Racer", { maxAttempts: 99 });
+      }
+      return originalBlock(taskCwd, taskId, reason, fence);
+    }) as typeof store.blockTask);
+
+    try {
+      await workHandler.execute(
+        { action: "work" },
+        createDirs(dirs.cwd),
+        createMockContext(dirs.cwd),
+        () => {},
+      );
+    } finally {
+      blockSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+
+    expect(claimed).toBe(true);
+    const after = store.getTask(dirs.cwd, task.id)!;
+    expect(after.status).toBe("todo");
+    expect(after.assigned_to).toBe("Racer");
+    expect(after.dispatch_token).toBeTruthy();
+    expect(after.attempt_count).toBe(6);
+    expect(spawnSpy).not.toHaveBeenCalled();
   });
 });

@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessengerState } from "../../lib.ts";
 import * as store from "../../crew/store.ts";
 import * as taskHandler from "../../crew/handlers/task.ts";
@@ -81,6 +81,58 @@ describe("crew/task.split", () => {
     expect(reloadedDownstream?.depends_on).not.toContain(parent.id);
     for (const subtaskId of subtaskIds) {
       expect(reloadedDownstream?.depends_on).toContain(subtaskId);
+    }
+  });
+
+  it("refuses an intervening claim instead of treating it as a split takeover", async () => {
+    const parent = store.createTask(cwd, "Parent task", "Parent work");
+    const original = store.mutateTask.bind(store);
+    let injected = false;
+
+    // Land a claim in the gap between the handler's snapshot and its guarded
+    // parent acceptance.
+    const spy = vi.spyOn(store, "mutateTask").mockImplementation(((
+      taskCwd: string,
+      taskId: string,
+      mutate: Parameters<typeof store.mutateTask>[2],
+      options?: Parameters<typeof store.mutateTask>[3],
+    ) => {
+      if (!injected && taskId === parent.id) {
+        injected = true;
+        original(taskCwd, taskId, () => ({
+          dispatch_token: "successor-token",
+          assigned_to: "Successor",
+          attempt_count: 1,
+        }));
+      }
+      return original(taskCwd, taskId, mutate, options);
+    }) as typeof store.mutateTask);
+
+    try {
+      const response = await taskHandler.execute(
+        "split",
+        {
+          id: parent.id,
+          subtasks: [{ title: "Slice one" }, { title: "Slice two" }],
+        },
+        createState(),
+        createMockContext(cwd),
+      );
+
+      expect(response.details.error).toBe("task_changed");
+      expect(store.getTasks(cwd)).toHaveLength(1);
+      const after = store.getTask(cwd, parent.id)!;
+      expect(after.status).toBe("todo");
+      expect(after.milestone).not.toBe(true);
+      expect(after.dispatch_token).toBe("successor-token");
+      expect(after.assigned_to).toBe("Successor");
+
+      // The reserved task survives; the successor still owns it.
+      expect(store.blockTask(cwd, parent.id, "stale split", {
+        dispatchToken: "old-token",
+      })).toBeNull();
+    } finally {
+      spy.mockRestore();
     }
   });
 

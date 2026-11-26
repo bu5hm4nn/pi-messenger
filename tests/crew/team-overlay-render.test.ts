@@ -1,11 +1,13 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createTempCrewDirs } from "../helpers/temp-dirs.ts";
 import * as store from "../../crew/store.ts";
 import * as teamStore from "../../crew/team/store.ts";
 import { renderStatusBar, renderTaskList } from "../../overlay-render.ts";
-import { createCrewViewState } from "../../overlay-actions.ts";
+import { createCrewViewState, setNotification } from "../../overlay-actions.ts";
 import { MessengerOverlay } from "../../overlay.ts";
-import type { FeedEvent } from "../../feed.ts";
+import { appendFeedEvent, type FeedEvent } from "../../feed.ts";
 
 const theme = { fg: (_color: string, text: string) => text } as any;
 
@@ -28,6 +30,41 @@ function event(seq: number, type: FeedEvent["type"], extra: Partial<FeedEvent> =
     type,
     ...extra,
   };
+}
+
+function createOverlay(cwd: string): MessengerOverlay {
+  const base = path.join(cwd, ".pi", "messenger");
+  const dirs = {
+    base,
+    registry: path.join(base, "registry"),
+    inbox: path.join(base, "inbox"),
+  };
+  fs.mkdirSync(dirs.registry, { recursive: true });
+  fs.mkdirSync(dirs.inbox, { recursive: true });
+  const state = {
+    agentName: "TestAgent",
+    registered: true,
+    watcher: null,
+    watcherRetries: 0,
+    watcherRetryTimer: null,
+    watcherDebounceTimer: null,
+    reservations: [],
+    chatHistory: new Map(),
+    unreadCounts: new Map(),
+    broadcastHistory: [],
+    seenSenders: new Map(),
+    model: "test",
+    cwd,
+    scopeToFolder: false,
+    isHuman: false,
+    session: {},
+    activity: { lastActivityAt: new Date().toISOString() },
+    customStatus: false,
+    registryFlushTimer: null,
+    sessionStartedAt: new Date().toISOString(),
+  } as any;
+  const tui = { requestRender: vi.fn() } as any;
+  return new MessengerOverlay(tui, theme, state, dirs, vi.fn(), {}, cwd);
 }
 
 describe("Team overlay render signals", () => {
@@ -69,6 +106,95 @@ describe("Crew idle overlay flash", () => {
     expect(viewState.notification?.message).toContain("crew idle");
     // The later task.done still surfaces after the idle flash.
     expect(viewState.pendingNotifications.join(" ")).toContain("completed");
+  });
+
+  it("advances the real cursor across two renders for equal-timestamp idle events", () => {
+    vi.useFakeTimers();
+    const { cwd } = createTempCrewDirs();
+    const overlay = createOverlay(cwd);
+    try {
+      // Empty first render establishes a zero baseline.
+      overlay.render();
+      const viewState = (overlay as any).crewViewState as ReturnType<typeof createCrewViewState>;
+      expect(viewState.lastSeenEventSeq).toBe(0);
+
+      const ts = "2026-01-01T00:00:02.000Z";
+      appendFeedEvent(cwd, { ts, agent: "crew", type: "task.done", target: "task-1" });
+      appendFeedEvent(cwd, { ts, agent: "crew", type: "crew.idle", preview: "outstanding work" });
+
+      // Second render reads both equal-ts events through the persisted cursor:
+      // the done flash shows and the unseen idle is queued, not suppressed.
+      overlay.render();
+      expect(viewState.notification?.message).toContain("completed");
+      expect(viewState.pendingNotifications.join(" ")).toContain("crew idle");
+    } finally {
+      overlay.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not suppress the first sequenced batch after a legacy-only render", () => {
+    vi.useFakeTimers();
+    const { cwd } = createTempCrewDirs();
+    const feedFile = path.join(cwd, ".pi", "messenger", "feed.jsonl");
+    fs.mkdirSync(path.dirname(feedFile), { recursive: true });
+    fs.writeFileSync(feedFile, `${JSON.stringify({
+      ts: "2026-01-01T00:00:00.000Z",
+      agent: "LegacyAgent",
+      type: "message",
+      preview: "legacy line without seq",
+    })}\n`);
+
+    const overlay = createOverlay(cwd);
+    try {
+      overlay.render();
+      const viewState = (overlay as any).crewViewState as ReturnType<typeof createCrewViewState>;
+      expect(viewState.lastSeenEventSeq).toBe(0);
+
+      appendFeedEvent(cwd, {
+        ts: "2026-01-01T00:00:01.000Z",
+        agent: "crew",
+        type: "task.done",
+        target: "task-1",
+      });
+
+      overlay.render();
+      expect(viewState.notification?.message).toContain("completed");
+    } finally {
+      overlay.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("overflow preserves an unseen idle flash by dropping the oldest ordinary one", () => {
+    vi.useFakeTimers();
+    try {
+      const viewState = createCrewViewState();
+      const tui = { requestRender: vi.fn() } as any;
+
+      // One visible flash, then a full ordinary queue.
+      setNotification(viewState, tui, true, "visible", true);
+      for (let i = 0; i < 10; i++) {
+        setNotification(viewState, tui, true, `ordinary ${i}`, true);
+      }
+      expect(viewState.pendingNotifications).toHaveLength(10);
+      expect(viewState.pendingNotifications[0]).toContain("ordinary 0");
+
+      // Overflow for an idle flash evicts the oldest ordinary entry.
+      setNotification(viewState, tui, true, "crew idle — outstanding work", true, true);
+      expect(viewState.pendingNotifications).toHaveLength(10);
+      expect(viewState.pendingNotifications.join(" ")).toContain("crew idle");
+      expect(viewState.pendingNotifications.join(" ")).not.toContain("ordinary 0");
+
+      // A later ordinary overflow likewise keeps idle and drops the next
+      // oldest ordinary rather than the idle entry.
+      setNotification(viewState, tui, true, "later ordinary", true);
+      expect(viewState.pendingNotifications.join(" ")).toContain("crew idle");
+      expect(viewState.pendingNotifications.join(" ")).not.toContain("ordinary 1");
+      if (viewState.notificationTimer) clearTimeout(viewState.notificationTimer);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("flashes two distinct idle transitions observed in separate batches", () => {

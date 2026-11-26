@@ -177,6 +177,52 @@ You are an implementer.
     expect(store.getTask(dirs.cwd, task.id)?.assigned_to).toBe("RenamedWorker-7f3a");
   });
 
+  it("rejects one task on a claim timeout without losing another launched worker's receipt", async () => {
+    const store = await import("../../crew/store.ts");
+    store.createPlan(dirs.cwd, "docs/PRD.md");
+    const t1 = store.createTask(dirs.cwd, "Timed out task", "Desc");
+    const t2 = store.createTask(dirs.cwd, "Launched task", "Desc");
+
+    const originalClaim = store.claimTaskForDispatch.bind(store);
+    const timeout = new store.TaskLockTimeoutError("/tmp/guard", [], "EEXIST");
+    const claimSpy = vi.spyOn(store, "claimTaskForDispatch").mockImplementation(((
+      cwd: string,
+      taskId: string,
+      workerName: string,
+      options?: Parameters<typeof store.claimTaskForDispatch>[3],
+    ) => {
+      if (taskId === t1.id) throw timeout;
+      return originalClaim(cwd, taskId, workerName, options);
+    }) as typeof store.claimTaskForDispatch);
+
+    const proc = createProcess();
+    spawnMock.mockReturnValue(proc);
+    const { spawnAgents } = await import("../../crew/agents.ts");
+
+    const resultPromise = spawnAgents([
+      { agent: "crew-worker", task: "first", taskId: t1.id, workerName: "TimeoutWorker" },
+      { agent: "crew-worker", task: "second", taskId: t2.id, workerName: "LaunchedWorker" },
+    ], dirs.cwd);
+
+    proc.exitCode = 0;
+    proc.emit("close", 0);
+    const results = await resultPromise;
+    claimSpy.mockRestore();
+
+    expect(results).toHaveLength(2);
+    const timedOut = results.find(result => result.taskId === t1.id)!;
+    expect(timedOut.errorCode).toBe("task_lock_timeout");
+    expect(timedOut.skipped).toBeUndefined();
+    expect(timedOut.error).toContain("Dispatch claim timed out");
+
+    const launched = results.find(result => result.taskId === t2.id)!;
+    expect(launched.workerName).toBe("LaunchedWorker");
+    expect(launched.dispatchToken).toBeTruthy();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    // The launched worker's receipt survives the other task's timeout.
+    expect(store.getTask(dirs.cwd, t2.id)?.dispatch_token).toBe(launched.dispatchToken);
+  });
+
   it("fails fast on terminal provider quota errors", async () => {
     const proc = createProcess();
     spawnMock.mockReturnValue(proc);

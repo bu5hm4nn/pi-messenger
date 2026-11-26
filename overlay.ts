@@ -731,14 +731,16 @@ export class MessengerOverlay implements Component, Focusable {
     lines.push(border("╰" + "─".repeat(innerW) + "╯"));
 
     // Advance on event identity, never on timestamp: equal timestamps are
-    // distinct events and must not be skipped.
+    // distinct events and must not be skipped. An empty or legacy-only first
+    // render establishes a zero baseline, so the first sequenced batch is not
+    // suppressed by the initial null cursor.
     let maxSeq = prevSeq;
     for (const event of allEvents) {
       if (typeof event.seq === "number" && (maxSeq === null || event.seq > maxSeq)) {
         maxSeq = event.seq;
       }
     }
-    this.crewViewState.lastSeenEventSeq = maxSeq;
+    this.crewViewState.lastSeenEventSeq = maxSeq ?? 0;
 
     return lines;
   }
@@ -759,8 +761,8 @@ export class MessengerOverlay implements Component, Focusable {
     const significant = newEvents.filter(e => MessengerOverlay.SIGNIFICANT_EVENTS.has(e.type));
     if (significant.length === 0) return;
 
-    const flash = (message: string) => {
-      setNotification(this.crewViewState, this.tui, true, message, true);
+    const flash = (message: string, idle = false) => {
+      setNotification(this.crewViewState, this.tui, true, message, true, idle);
     };
     const singleMessage = (last: FeedEvent): string => {
       const target = last.target ? ` ${last.target}` : "";
@@ -802,7 +804,7 @@ export class MessengerOverlay implements Component, Focusable {
       if (event.type === "crew.idle") {
         // Flush earlier events first so the order of the batch is preserved.
         flushRun();
-        flash(singleMessage(event));
+        flash(singleMessage(event), true);
         continue;
       }
       if (run.length > 0 && run[run.length - 1].type !== event.type) flushRun();

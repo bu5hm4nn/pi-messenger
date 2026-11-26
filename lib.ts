@@ -50,6 +50,8 @@ export interface AgentMailMessage {
   text: string;
   timestamp: string;
   replyTo: string | null;
+  /** Trusted dispatch reservation attached to a task-assignment message. */
+  dispatchToken?: string;
 }
 
 interface AgentMailMessageInput {
@@ -61,6 +63,7 @@ interface AgentMailMessageInput {
   timestamp?: unknown;
   ts?: unknown;
   replyTo?: unknown;
+  dispatchToken?: unknown;
 }
 
 function stringField(value: unknown, fallback: string): string {
@@ -82,6 +85,9 @@ export function normalizeAgentMailMessage(
     text: stringField(raw.text, stringField(raw.message, "")),
     timestamp: stringField(raw.timestamp, stringField(raw.ts, defaults.timestamp)),
     replyTo: typeof raw.replyTo === "string" ? raw.replyTo : null,
+    ...(typeof raw.dispatchToken === "string" && raw.dispatchToken.length > 0
+      ? { dispatchToken: raw.dispatchToken }
+      : {}),
   };
 }
 

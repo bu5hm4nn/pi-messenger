@@ -229,20 +229,49 @@ export function spawnLobbyWorker(
     if (worker.assignedTaskId) {
       // One shared guarded exit: the ownership/token check and the write happen
       // inside the mutation, so a task that was reassigned or completed while
-      // this worker was dying is left untouched.
+      // this worker was dying is left untouched. A guard timeout is logged and
+      // swallowed: a dying worker must never crash the lobby host.
       const config = loadCrewConfig(store.getCrewDir(cwd));
-      const exit = store.exitAttempt(cwd, worker.assignedTaskId, {
-        owner: worker.name,
-        dispatchToken: worker.dispatchToken,
-        maxAttempts: config.work.maxAttemptsPerTask,
-      });
-      if (exit.outcome === "blocked") {
-        logFeedEvent(cwd, worker.name, "task.block", worker.assignedTaskId, `Max attempts reached`);
-      } else if (exit.outcome === "todo") {
-        const baseRef = exit.task?.base_commit ? ` Prior attempt base commit: ${exit.task.base_commit}.` : "";
+      let exit: store.ExitAttemptResult | null = null;
+      try {
+        exit = store.exitAttempt(cwd, worker.assignedTaskId, {
+          owner: worker.name,
+          dispatchToken: worker.dispatchToken,
+          maxAttempts: config.work.maxAttemptsPerTask,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (err instanceof store.TaskLockTimeoutError) {
+          console.error(`[pi-messenger] lobby exit for ${worker.assignedTaskId} timed out: ${message}`);
+        } else {
+          console.error(`[pi-messenger] lobby exit for ${worker.assignedTaskId} failed: ${message}`);
+        }
+      }
+
+      if (exit?.outcome === "blocked" || exit?.outcome === "todo") {
+        // The shared exit returns the validated prior-attempt snapshot. Record
+        // the reconcile note for BOTH owned outcomes (todo and cap-block), so a
+        // final allowed attempt still carries its base anchor.
+        const prior = exit.previous ?? exit.task;
+        const baseRef = prior?.base_commit ? ` Prior attempt base commit: ${prior.base_commit}.` : "";
+        const neverStarted = exit.previous?.status === "todo";
+        const wording = neverStarted
+          ? "before task.start — work may not have started — verify state before retrying."
+          : "before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing.";
+        const suffix = exit.outcome === "blocked" ? " Blocked at max attempts." : " Reset to todo.";
         store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
-          `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing.${baseRef} Reset to todo.`);
-        logFeedEvent(cwd, worker.name, "task.reset", worker.assignedTaskId, "worker exited");
+          `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) ${wording}${baseRef}${suffix}`);
+        if (exit.outcome === "blocked") {
+          logFeedEvent(cwd, worker.name, "task.block", worker.assignedTaskId, `Max attempts reached`);
+        } else {
+          logFeedEvent(cwd, worker.name, "task.reset", worker.assignedTaskId, "worker exited");
+        }
+      } else if (exit?.outcome === "changed") {
+        // Owner/token mismatch: only the rejection reason, never a reset or
+        // reconcile note that could be mistaken for this worker's attempt.
+        const current = store.getTask(cwd, worker.assignedTaskId);
+        store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
+          `Ignored stale exit from ${worker.name}: task holds a different reservation or completion (status ${current?.status ?? "missing"}); left untouched.`);
       }
     } else {
       logFeedEvent(cwd, worker.name, "leave", undefined, `Lobby worker exited (code ${exitCode ?? "unknown"})`);
@@ -310,6 +339,7 @@ export function assignTaskToLobbyWorker(
   taskId: string,
   taskPrompt: string,
   inboxDir: string,
+  dispatchToken?: string,
 ): boolean {
   if (worker.assignedTaskId) return false;
   if (worker.proc.exitCode !== null) return false;
@@ -330,6 +360,9 @@ Drop your current activity and work on this task immediately.
 ${taskPrompt}`,
     timestamp: new Date().toISOString(),
     replyTo: null,
+    // Structured (not prompt text) so the worker extension can attach the
+    // trusted reservation to task.done/block/reset without the model typing it.
+    ...(dispatchToken ? { dispatchToken } : {}),
   };
 
   const random = Math.random().toString(36).substring(2, 8);
@@ -349,6 +382,10 @@ ${taskPrompt}`,
 
   removeLiveWorker(worker.cwd, lobbyTaskId(worker.lobbyId));
   worker.assignedTaskId = taskId;
+  // The warm worker was spawned before the claim, so it has no dispatch token
+  // in its environment. Carry the minted token on the registry entry so the
+  // close handler fences with the reservation rather than a reusable name.
+  worker.dispatchToken = dispatchToken;
   return true;
 }
 
@@ -421,14 +458,30 @@ export function spawnWorkerForTask(
   // The worker identity must exist before the claim: the reservation records
   // assigned_to, and both task.start and the receipt are fenced by it.
   const workerName = allocateLobbyWorkerName(cwd);
-  const claimed = store.claimTaskForDispatch(cwd, taskId, workerName, {
-    maxAttempts: config.work.maxAttemptsPerTask,
-  });
+  let claimed: Awaited<ReturnType<typeof store.claimTaskForDispatch>>;
+  try {
+    claimed = store.claimTaskForDispatch(cwd, taskId, workerName, {
+      maxAttempts: config.work.maxAttemptsPerTask,
+    });
+  } catch (err) {
+    // A guard timeout rejects only this spawn; callers continue their loop.
+    if (err instanceof store.TaskLockTimeoutError) return null;
+    throw err;
+  }
   if (!claimed || !claimed.dispatch_token) return null;
   const dispatchToken = claimed.dispatch_token;
 
   const baseCommit = store.getBaseCommit(cwd); // git never runs inside the guard
-  const started = store.startTask(cwd, taskId, workerName, { baseCommit, dispatchToken });
+  let started: Awaited<ReturnType<typeof store.startTask>>;
+  try {
+    started = store.startTask(cwd, taskId, workerName, { baseCommit, dispatchToken });
+  } catch (err) {
+    if (err instanceof store.TaskLockTimeoutError) {
+      try { store.releaseDispatch(cwd, taskId, dispatchToken); } catch {}
+      return null;
+    }
+    throw err;
+  }
   if (!started) {
     store.releaseDispatch(cwd, taskId, dispatchToken);
     return null;

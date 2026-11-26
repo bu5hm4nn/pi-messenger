@@ -66,7 +66,7 @@ export function spawnWorkersForReadyTasks(
       continue;
     }
 
-    if (!assignTaskToLobbyWorker(lw, task.id, prompt, inboxDir)) {
+    if (!assignTaskToLobbyWorker(lw, task.id, prompt, inboxDir, dispatchToken)) {
       store.exitAttempt(cwd, task.id, {
         owner: lw.name,
         dispatchToken,

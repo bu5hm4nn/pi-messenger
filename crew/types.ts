@@ -196,6 +196,8 @@ export interface AgentResult {
   dispatchToken?: string;
   /** Dispatch was abandoned because the task was no longer claimable. */
   skipped?: boolean;
+  /** Typed per-task launch failure (e.g. "task_lock_timeout"). */
+  errorCode?: string;
   wasGracefullyShutdown?: boolean;
   error?: string;
   artifactPaths?: {

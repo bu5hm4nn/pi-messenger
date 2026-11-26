@@ -21,6 +21,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 vi.mock("../../crew/store.ts", () => ({
+  TaskLockTimeoutError: class MockTaskLockTimeoutError extends Error {},
   getPlan: vi.fn(() => ({ prd: "docs/PRD.md" })),
   getCrewDir: vi.fn((cwd: string) => `${cwd}/.pi/messenger/crew`),
   getTask: vi.fn(() => null),
@@ -220,17 +221,23 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker(cwd)!;
     expect(worker.assignedTaskId).toBeNull();
 
-    const assigned = lobby.assignTaskToLobbyWorker(worker, "task-3", "# Task 3\nDo stuff", inboxDir);
+    const assigned = lobby.assignTaskToLobbyWorker(worker, "task-3", "# Task 3\nDo stuff", inboxDir, "lobby-dispatch-token");
     expect(assigned).toBe(true);
     expect(worker.assignedTaskId).toBe("task-3");
+    // The warm delivery conveys the minted token so the close handler fences
+    // with the reservation, not the reusable worker name.
+    expect(worker.dispatchToken).toBe("lobby-dispatch-token");
     expect(lobby.getAvailableLobbyWorkers(cwd)).toHaveLength(0);
 
     const inbox = path.join(inboxDir, worker.name);
     const messageFile = fs.readdirSync(inbox).find(file => file.endsWith(".json"));
     expect(messageFile).toBeTruthy();
-    const message = JSON.parse(fs.readFileSync(path.join(inbox, messageFile!), "utf-8")) as { text: string };
+    const message = JSON.parse(fs.readFileSync(path.join(inbox, messageFile!), "utf-8")) as { text: string; dispatchToken?: string };
     expect(message.text).toContain("Follow the assignment below");
     expect(message.text).not.toContain("reserving files, implementing, testing, committing");
+    // Structured, not prompt text: the extension attaches it, not the model.
+    expect(message.dispatchToken).toBe("lobby-dispatch-token");
+    expect(message.text).not.toContain("lobby-dispatch-token");
   });
 
   it("assignTaskToLobbyWorker rejects already-assigned worker", () => {
@@ -320,6 +327,7 @@ describe("lobby workers", () => {
 
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-1";
+    worker.dispatchToken = "warm-dispatch-token";
 
     vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({
       outcome: "todo",
@@ -338,6 +346,7 @@ describe("lobby workers", () => {
     // The ownership check and the write happen inside one guarded mutation.
     expect(storeModule.exitAttempt).toHaveBeenCalledWith("/test/cwd", "task-1", expect.objectContaining({
       owner: worker.name,
+      dispatchToken: "warm-dispatch-token",
     }));
     expect(storeModule.appendTaskProgress).toHaveBeenCalledWith(
       "/test/cwd", "task-1", "system",
@@ -363,7 +372,17 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-2";
 
-    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({ outcome: "blocked", task: null });
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({
+      outcome: "blocked",
+      task: {
+        id: "task-2", title: "Test", status: "blocked", attempt_count: 3,
+        depends_on: [], created_at: "", base_commit: "feedface",
+      } as any,
+      previous: {
+        id: "task-2", title: "Test", status: "in_progress", attempt_count: 3,
+        depends_on: [], created_at: "", base_commit: "feedface",
+      } as any,
+    });
 
     const proc = worker.proc as any;
     proc._handlers["close"](1);
@@ -372,6 +391,15 @@ describe("lobby workers", () => {
       owner: worker.name,
       maxAttempts: 3,
     }));
+    // The cap-block path still records the base-anchored reconcile note.
+    expect(storeModule.appendTaskProgress).toHaveBeenCalledWith(
+      "/test/cwd", "task-2", "system",
+      expect.stringContaining("indeterminate: work may have landed"),
+    );
+    expect(storeModule.appendTaskProgress).toHaveBeenCalledWith(
+      "/test/cwd", "task-2", "system",
+      expect.stringContaining("Prior attempt base commit: feedface."),
+    );
     expect(feedModule.logFeedEvent).toHaveBeenCalledWith(
       "/test/cwd", worker.name, "task.block", "task-2", "Max attempts reached",
     );
@@ -411,9 +439,33 @@ describe("lobby workers", () => {
     expect(storeModule.exitAttempt).toHaveBeenCalledWith("/test/cwd", "task-4", expect.objectContaining({
       owner: worker.name,
     }));
+    expect(storeModule.appendTaskProgress).toHaveBeenCalledWith(
+      "/test/cwd", "task-4", "system",
+      expect.stringContaining("Ignored stale exit"),
+    );
     expect(storeModule.appendTaskProgress).not.toHaveBeenCalledWith(
       "/test/cwd", "task-4", "system", expect.stringContaining("Reset to todo"),
     );
+  });
+
+  it("close handler survives an exitAttempt lock timeout", async () => {
+    const storeModule = await import("../../crew/store.ts");
+    const worker = lobby.spawnLobbyWorker("/test/cwd")!;
+    worker.assignedTaskId = "task-timeout";
+
+    vi.mocked(storeModule.exitAttempt).mockImplementationOnce(() => {
+      const TimeoutError = (storeModule as unknown as { TaskLockTimeoutError: new (message: string) => Error }).TaskLockTimeoutError;
+      throw new TimeoutError("Timed out waiting for filesystem guard /guard (held by pid 1); Stop all crew writers for this project, then remove the named marker file and the (now empty) guard directory, then retry.");
+    });
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const proc = worker.proc as any;
+      expect(() => proc._handlers["close"](0)).not.toThrow();
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("lobby exit for task-timeout"));
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("exports token budgets that scale with coordination level", () => {

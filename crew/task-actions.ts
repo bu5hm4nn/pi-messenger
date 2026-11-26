@@ -73,7 +73,11 @@ export function executeTaskAction(
       if (!reason) {
         return { success: false, error: "missing_reason", message: `Reason required to block ${taskId}` };
       }
-      const blocked = store.blockTask(cwd, taskId, reason);
+      // A worker session carries the trusted dispatch token; the mutation
+      // re-checks it under the guard so a same-name successor is untouched.
+      const blocked = store.blockTask(cwd, taskId, reason, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (!blocked) return { success: false, error: "block_failed", message: `Failed to block ${taskId}` };
       logFeedEvent(cwd, agentName, "task.block", taskId, reason);
       return { success: true, message: `Blocked ${taskId}`, task: blocked };
@@ -83,7 +87,9 @@ export function executeTaskAction(
       if (task.status !== "blocked") {
         return { success: false, error: "invalid_status", message: `Task ${taskId} is ${task.status}, not blocked` };
       }
-      const unblocked = store.unblockTask(cwd, taskId);
+      const unblocked = store.unblockTask(cwd, taskId, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (!unblocked) return { success: false, error: "unblock_failed", message: `Failed to unblock ${taskId}` };
       logFeedEvent(cwd, agentName, "task.unblock", taskId, unblocked.title);
       return { success: true, message: `Unblocked ${taskId}`, task: unblocked };
@@ -93,7 +99,9 @@ export function executeTaskAction(
       if (options?.isWorkerActive?.(taskId)) {
         return { success: false, error: "active_worker", message: `Cannot reset ${taskId} while its worker is active` };
       }
-      const resetTasks = store.resetTask(cwd, taskId, false);
+      const resetTasks = store.resetTask(cwd, taskId, false, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (resetTasks.length === 0) return { success: false, error: "reset_failed", message: `Failed to reset ${taskId}` };
       logFeedEvent(cwd, agentName, "task.reset", taskId, task.title);
       return { success: true, message: `Reset ${taskId}`, resetTasks };
@@ -105,7 +113,11 @@ export function executeTaskAction(
       if (activeTask) {
         return { success: false, error: "active_worker", message: `Cannot reset ${activeTask.id} while its worker is active` };
       }
-      const resetTasks = store.resetTask(cwd, taskId, true);
+      // The worker's token fences the root takeover; dependent resets remain
+      // part of the same explicit cascade once the root is accepted.
+      const resetTasks = store.resetTask(cwd, taskId, true, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (resetTasks.length === 0) return { success: false, error: "reset_failed", message: `Failed to reset ${taskId}` };
       logFeedEvent(cwd, agentName, "task.reset", taskId, `cascade (${resetTasks.length} tasks)`);
       return { success: true, message: `Reset ${taskId} + ${Math.max(0, resetTasks.length - 1)} dependents`, resetTasks };

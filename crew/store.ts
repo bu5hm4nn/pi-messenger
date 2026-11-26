@@ -62,11 +62,34 @@ function readJson<T>(filePath: string): T | null {
   }
 }
 
-function writeJson(filePath: string, data: unknown): void {
+function stageFile(filePath: string, content: string): string {
   ensureDir(path.dirname(filePath));
-  const temp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(temp, JSON.stringify(data, null, 2));
-  fs.renameSync(temp, filePath);
+  const temp = `${filePath}.tmp-${process.pid}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  fs.writeFileSync(temp, content);
+  return temp;
+}
+
+function cleanupStagedFile(temp: string): void {
+  try { fs.unlinkSync(temp); } catch {}
+}
+
+/** Unlink a file that may have vanished between the scan and the unlink. */
+function unlinkIfExists(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+}
+
+function writeJson(filePath: string, data: unknown): void {
+  const temp = stageFile(filePath, JSON.stringify(data, null, 2));
+  try {
+    fs.renameSync(temp, filePath);
+  } catch (err) {
+    cleanupStagedFile(temp);
+    throw err;
+  }
 }
 
 function readText(filePath: string): string | null {
@@ -79,10 +102,13 @@ function readText(filePath: string): string | null {
 }
 
 function writeText(filePath: string, content: string): void {
-  ensureDir(path.dirname(filePath));
-  const temp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(temp, content);
-  fs.renameSync(temp, filePath);
+  const temp = stageFile(filePath, content);
+  try {
+    fs.renameSync(temp, filePath);
+  } catch (err) {
+    cleanupStagedFile(temp);
+    throw err;
+  }
 }
 
 // =============================================================================
@@ -183,6 +209,15 @@ export interface TaskMutationContext {
   markerName: string;
 }
 
+export interface TaskMutationOptions {
+  /**
+   * Publish a companion file (e.g. the task spec) while the per-task guard is
+   * still held. The task JSON has already been written when this runs, so a
+   * stale generation/rev precondition fails before the companion is touched.
+   */
+  publish?: (task: Task) => void;
+}
+
 /**
  * Guarded task mutation. The mutator runs against the freshly-read task while
  * holding the per-task guard; returning null aborts without writing. Callers
@@ -196,6 +231,7 @@ export function mutateTask(
   cwd: string,
   taskId: string,
   mutate: (task: Task, guard: TaskMutationContext) => Partial<Task> | null,
+  options?: TaskMutationOptions,
 ): Task | null {
   const guard = acquireTaskGuard(cwd, taskId);
   try {
@@ -207,19 +243,30 @@ export function mutateTask(
     const updates = mutate(task, { guardPath: guard.guardPath, markerName: guard.markerName });
     if (!updates) return null;
 
-    // Pre-publish guard: one stat. If reclaimers removed our marker we look
-    // dead, so publishing now would collide with whoever holds the guard.
-    if (!fs.existsSync(path.join(guard.guardPath, guard.markerName))) {
-      throw new TaskLockLostError(guard.guardPath, guard.markerName);
-    }
-
     const updated: Task = {
       ...task,
       ...updates,
       updated_at: new Date().toISOString(),
       rev: (task.rev ?? 0) + 1,
     };
-    writeJson(getTaskPath(cwd, taskId), updated);
+
+    // Stage first, then stat our own marker immediately before the rename.
+    // If a reclaimer removed the marker while the mutator ran we look dead, so
+    // publishing now would collide with whoever holds the guard. The staged
+    // temp is private and is cleaned up on refusal.
+    const taskPath = getTaskPath(cwd, taskId);
+    const temp = stageFile(taskPath, JSON.stringify(updated, null, 2));
+    try {
+      if (!fs.existsSync(path.join(guard.guardPath, guard.markerName))) {
+        throw new TaskLockLostError(guard.guardPath, guard.markerName);
+      }
+      fs.renameSync(temp, taskPath);
+    } catch (err) {
+      cleanupStagedFile(temp);
+      throw err;
+    }
+
+    options?.publish?.(updated);
     return updated;
   } finally {
     releaseTaskGuard(guard);
@@ -275,7 +322,7 @@ export function deletePlan(cwd: string): boolean {
   const planPath = path.join(getCrewDir(cwd), "plan.json");
   const planMdPath = path.join(getCrewDir(cwd), "plan.md");
   const tasksDir = getTasksDir(cwd);
-  
+
   let deleted = false;
 
   // Allocation is serialized against creates so no id is handed out while the
@@ -283,21 +330,21 @@ export function deletePlan(cwd: string): boolean {
   const allocGuard = acquireDirMutex(getAllocGuardPath(cwd));
 
   try {
-    // Delete plan.json
+    // Delete plan.json / plan.md. They can vanish under us if another sweep
+    // already removed them; ENOENT is a skip, never a throw.
     if (fs.existsSync(planPath)) {
-      fs.unlinkSync(planPath);
+      unlinkIfExists(planPath);
       deleted = true;
     }
+    unlinkIfExists(planMdPath);
 
-    // Delete plan.md
-    if (fs.existsSync(planMdPath)) {
-      fs.unlinkSync(planMdPath);
-    }
-
-    // Delete task files, but never sweep a live guard or an in-flight temp
-    // file. A task whose guard is held is skipped: its writer owns it.
+    // Collect each task's complete file set from the task and block dirs, then
+    // acquire ONE guard per task for all of it. A task whose guard is held is
+    // skipped entirely: its writer owns every file in the set. Hidden entries
+    // (.locks, stage dirs) and in-flight temp files are never swept.
+    const taskIds = new Set<string>();
+    const unguardedTaskFiles: string[] = [];
     if (fs.existsSync(tasksDir)) {
-      const skipped = new Set<string>();
       for (const entry of fs.readdirSync(tasksDir)) {
         if (entry === ".locks" || entry.startsWith(".")) continue;
         if (entry.includes(".tmp-")) continue;
@@ -307,32 +354,49 @@ export function deletePlan(cwd: string): boolean {
         if (!isFile) continue;
 
         const taskMatch = entry.match(/^(task-\d+)\./);
-        if (taskMatch) {
-          const taskId = taskMatch[1];
-          if (skipped.has(taskId)) continue;
-          const guard = tryAcquireTaskGuard(cwd, taskId);
-          if (!guard) {
-            skipped.add(taskId);
-            continue;
-          }
-          try { fs.unlinkSync(fullPath); } finally { releaseTaskGuard(guard); }
-        } else {
-          fs.unlinkSync(fullPath);
-        }
+        if (taskMatch) taskIds.add(taskMatch[1]);
+        else unguardedTaskFiles.push(fullPath);
       }
     }
 
-    // Delete all block files
     const blocksDir = getBlocksDir(cwd);
+    const unguardedBlockFiles: string[] = [];
     if (fs.existsSync(blocksDir)) {
       for (const file of fs.readdirSync(blocksDir)) {
-        try { fs.unlinkSync(path.join(blocksDir, file)); } catch {}
+        if (file.startsWith(".") || file.includes(".tmp-")) continue;
+        const fullPath = path.join(blocksDir, file);
+        let isFile = false;
+        try { isFile = fs.statSync(fullPath).isFile(); } catch { continue; }
+        if (!isFile) continue;
+
+        const taskMatch = file.match(/^(task-\d+)\.md$/);
+        if (taskMatch) taskIds.add(taskMatch[1]);
+        else unguardedBlockFiles.push(fullPath);
       }
+    }
+
+    for (const taskId of taskIds) {
+      const guard = tryAcquireTaskGuard(cwd, taskId);
+      if (!guard) continue;
+      try {
+        for (const ext of [".json", ".md", ".progress.md"]) {
+          unlinkIfExists(path.join(tasksDir, `${taskId}${ext}`));
+        }
+        unlinkIfExists(path.join(blocksDir, `${taskId}.md`));
+      } finally {
+        releaseTaskGuard(guard);
+      }
+    }
+
+    // Files outside the task-id namespace have no writer guard to coordinate
+    // with; remove them only after the per-task sets are done.
+    for (const filePath of [...unguardedTaskFiles, ...unguardedBlockFiles]) {
+      unlinkIfExists(filePath);
     }
   } finally {
     releaseTaskGuard(allocGuard);
   }
-  
+
   return deleted;
 }
 
@@ -400,22 +464,25 @@ export function createTask(
       };
 
       writeJson(taskPath, task);
+
+      // Publish the initial spec under the same alloc lock as the JSON:
+      // releasing between the two lets deletePlan see the JSON without the
+      // spec (or vice versa) and splits one task across two critical sections.
+      const specContent = description
+        ? `# ${title}\n\n${description}\n`
+        : `# ${title}\n\n*Spec pending*\n`;
+      writeText(getTaskSpecPath(cwd, id), specContent);
       break;
+    }
+
+    // Plan accounting is part of the same critical section: a concurrent
+    // deletePlan must not interleave between task publication and the count.
+    const plan = getPlan(cwd);
+    if (plan) {
+      updatePlan(cwd, { task_count: plan.task_count + 1 });
     }
   } finally {
     releaseTaskGuard(allocGuard);
-  }
-
-  // Create task spec file
-  const specContent = description
-    ? `# ${title}\n\n${description}\n`
-    : `# ${title}\n\n*Spec pending*\n`;
-  writeText(getTaskSpecPath(cwd, task.id), specContent);
-
-  // Update plan task count
-  const plan = getPlan(cwd);
-  if (plan) {
-    updatePlan(cwd, { task_count: plan.task_count + 1 });
   }
 
   return task;
@@ -575,16 +642,18 @@ export function applyTaskRevision(
   revision: TaskRevisionInput,
   options?: SpecEditOptions,
 ): Task | null {
-  const updated = mutateTask(cwd, taskId, task => {
+  // The generation bump (task JSON) and the spec publication happen under the
+  // same per-task guard: a reader that takes the guard cannot observe one
+  // without the other, and a stale edit aborts before the spec is touched.
+  return mutateTask(cwd, taskId, task => {
     assertGeneration(task, options);
     return {
       ...(revision.title ? { title: revision.title } : {}),
       generation: (task.generation ?? 0) + 1,
     };
+  }, {
+    publish: () => writeText(getTaskSpecPath(cwd, taskId), revision.spec),
   });
-  if (!updated) return null;
-  writeText(getTaskSpecPath(cwd, taskId), revision.spec);
-  return updated;
 }
 
 export function setTaskSpec(cwd: string, taskId: string, content: string, options?: SpecEditOptions): boolean {
@@ -658,7 +727,9 @@ export interface ClaimOptions {
 /**
  * Reserve a todo task for one dispatch. The reservation is the dispatch
  * token; the attempt is charged exactly here, once per dispatch, so a worker
- * that never reaches task.start still consumed its budget.
+ * that never reaches task.start still consumed its budget. This claim-time
+ * charging contract is adjudicated and stands: exitAttempt never re-charges
+ * and an explicit reset does not silently renew the budget.
  */
 export function claimTaskForDispatch(
   cwd: string,
@@ -687,10 +758,25 @@ export interface StartOptions {
   dispatchToken?: string;
 }
 
+// Manual (human/orchestrator) starts mint a session-held token that is never
+// handed to a spawned worker. The prefix distinguishes it from a dispatch
+// reservation, so a name-only caller may finish its own manual session while
+// it can never act on a token-bearing worker attempt.
+const MANUAL_TOKEN_PREFIX = "session-";
+
+function mintManualToken(): string {
+  return `${MANUAL_TOKEN_PREFIX}${randomUUID()}`;
+}
+
+function isManualToken(token: string | undefined): boolean {
+  return token?.startsWith(MANUAL_TOKEN_PREFIX) === true;
+}
+
 /**
  * todo -> in_progress. With a dispatch token the start must match the
  * reservation and does not re-charge the attempt; a manual human start mints
- * a session-held token and charges the attempt here.
+ * a session-held token and charges the attempt here. A name-only caller can
+ * never start another dispatch's token-bearing attempt.
  */
 export function startTask(
   cwd: string,
@@ -704,9 +790,10 @@ export function startTask(
     if (task.status !== "todo") return null;
     if (dispatchToken !== undefined) {
       if (task.dispatch_token !== dispatchToken) return null;
-    } else if (task.dispatch_token && task.assigned_to !== agentName) {
-      // Reserved for another dispatch: only its owner may start it.
-      return null;
+    } else if (task.dispatch_token !== undefined) {
+      // A reservation exists. Only the manual-session owner may resume it;
+      // a same-name worker without the token must not act on it.
+      if (!isManualToken(task.dispatch_token) || task.assigned_to !== agentName) return null;
     }
     const alreadyCharged = task.dispatch_token !== undefined;
     return {
@@ -715,7 +802,7 @@ export function startTask(
       base_commit: baseCommit,
       assigned_to: agentName,
       attempt_count: alreadyCharged ? task.attempt_count : task.attempt_count + 1,
-      dispatch_token: task.dispatch_token ?? randomUUID(),
+      dispatch_token: task.dispatch_token ?? mintManualToken(),
     };
   });
 }
@@ -727,7 +814,8 @@ export interface CompleteOptions {
 
 /**
  * in_progress -> done. Requires the live reservation (token) or, for callers
- * without a token (lobby/manual), the recorded owner to match.
+ * without a token, the recorded owner of a manual session. A name-only caller
+ * can never complete a token-bearing dispatch attempt.
  */
 export function completeTask(
   cwd: string,
@@ -742,8 +830,9 @@ export function completeTask(
     if (task.status !== "in_progress") return null;
     if (dispatchToken !== undefined) {
       if (task.dispatch_token !== dispatchToken) return null;
-    } else if (completedBy !== undefined && task.assigned_to !== completedBy) {
-      return null;
+    } else {
+      if (task.dispatch_token !== undefined && !isManualToken(task.dispatch_token)) return null;
+      if (completedBy !== undefined && task.assigned_to !== completedBy) return null;
     }
     return {
       status: "done",
@@ -777,13 +866,30 @@ export interface LifecycleFence {
   dispatchToken?: string;
 }
 
+export interface BlockOptions extends LifecycleFence {
+  /** Only block while the task is still in this status. */
+  expectedStatus?: TaskStatus;
+  /** Only block a task that has no live dispatch reservation. */
+  requireNoDispatchToken?: boolean;
+  /** Only block at/above this attempt count (auto-block re-check). */
+  minAttemptCount?: number;
+  /** For a done task: only block while this completion still owns it. */
+  completedDispatch?: string;
+  completedBy?: string;
+}
+
 export function blockTask(
   cwd: string,
   taskId: string,
   reason: string,
-  fence?: LifecycleFence,
+  fence?: BlockOptions,
 ): Task | null {
   const updated = mutateTask(cwd, taskId, task => {
+    if (fence?.expectedStatus !== undefined && task.status !== fence.expectedStatus) return null;
+    if (fence?.requireNoDispatchToken && task.dispatch_token !== undefined) return null;
+    if (fence?.minAttemptCount !== undefined && (task.attempt_count ?? 0) < fence.minAttemptCount) return null;
+    if (fence?.completedDispatch !== undefined && task.completed_dispatch !== fence.completedDispatch) return null;
+    if (fence?.completedBy !== undefined && task.completed_by !== fence.completedBy) return null;
     if (fence?.dispatchToken !== undefined && task.dispatch_token !== fence.dispatchToken) return null;
     if (fence?.owner !== undefined && task.assigned_to !== fence.owner) return null;
     return {
@@ -832,8 +938,23 @@ export function unblockTask(cwd: string, taskId: string, fence?: LifecycleFence)
   return updated;
 }
 
+export interface ResetLifecycleSnapshot {
+  status: TaskStatus;
+  createdAt?: string;
+  assignedTo?: string;
+  dispatchToken?: string;
+  completedAt?: string;
+  completedDispatch?: string;
+}
+
 export interface ResetTaskOptions extends LifecycleFence {
   expectedStatus?: TaskStatus;
+  /**
+   * Revalidate the lifecycle state captured before a planning pass. Spec edits
+   * may have bumped generation/rev since then, but a claim or completion must
+   * refuse the reset instead of being treated as a takeover.
+   */
+  expectedLifecycle?: ResetLifecycleSnapshot;
 }
 
 export function resetTask(
@@ -849,6 +970,15 @@ export function resetTask(
   // live dispatch reservation).
   const updated = mutateTask(cwd, taskId, task => {
     if (options?.expectedStatus !== undefined && task.status !== options.expectedStatus) return null;
+    const expected = options?.expectedLifecycle;
+    if (expected) {
+      if (task.status !== expected.status) return null;
+      if ((task.created_at ?? undefined) !== (expected.createdAt ?? undefined)) return null;
+      if ((task.assigned_to ?? undefined) !== (expected.assignedTo ?? undefined)) return null;
+      if ((task.dispatch_token ?? undefined) !== (expected.dispatchToken ?? undefined)) return null;
+      if ((task.completed_at ?? undefined) !== (expected.completedAt ?? undefined)) return null;
+      if ((task.completed_dispatch ?? undefined) !== (expected.completedDispatch ?? undefined)) return null;
+    }
     if (options?.dispatchToken !== undefined && task.dispatch_token !== options.dispatchToken) return null;
     if (options?.owner !== undefined && task.assigned_to !== options.owner) return null;
     wasDone = task.status === "done";
@@ -904,23 +1034,26 @@ export interface ExitAttemptOptions extends LifecycleFence {
 
 export interface ExitAttemptResult {
   outcome: "blocked" | "todo" | "missing" | "changed";
+  /** Updated task after an accepted exit (null when refused/missing). */
   task: Task | null;
+  /** Validated prior-attempt snapshot captured under the guard. */
+  previous: Task | null;
 }
 
 /**
  * One guarded exit used by every crash/receipt path (work.ts receipts and the
  * lobby close handler). The attempt was already charged at claim, so this
  * only releases the reservation or blocks at the attempt cap -- it never
- * re-charges, and it never touches a task owned by a newer dispatch.
+ * re-charges, and it never touches a task owned by a newer dispatch. When both
+ * owner and token are supplied BOTH must match.
  */
 export function exitAttempt(cwd: string, taskId: string, options: ExitAttemptOptions = {}): ExitAttemptResult {
   let outcome: ExitAttemptResult["outcome"] = "changed";
+  let previous: Task | null = null;
   const updated = mutateTask(cwd, taskId, task => {
-    if (options.dispatchToken !== undefined) {
-      if (task.dispatch_token !== options.dispatchToken) return null;
-    } else if (options.owner !== undefined) {
-      if (task.assigned_to !== options.owner) return null;
-    }
+    previous = task;
+    if (options.dispatchToken !== undefined && task.dispatch_token !== options.dispatchToken) return null;
+    if (options.owner !== undefined && task.assigned_to !== options.owner) return null;
     if (task.status === "todo") {
       if (!task.dispatch_token) return null;
     } else if (task.status !== "in_progress") {
@@ -941,8 +1074,8 @@ export function exitAttempt(cwd: string, taskId: string, options: ExitAttemptOpt
     return { status: "todo", assigned_to: undefined, dispatch_token: undefined };
   });
 
-  if (updated) return { outcome, task: updated };
-  return { outcome: getTask(cwd, taskId) ? "changed" : "missing", task: null };
+  if (updated) return { outcome, task: updated, previous };
+  return { outcome: getTask(cwd, taskId) ? "changed" : "missing", task: null, previous };
 }
 
 // =============================================================================

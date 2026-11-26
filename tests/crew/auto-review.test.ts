@@ -15,7 +15,7 @@ function completedTask(cwd: string, title: string, deps: string[] = []): Task {
     baseCommit: "abc123",
     dispatchToken: claimed?.dispatch_token,
   });
-  store.completeTask(cwd, task.id, "Done", undefined, "TestWorker");
+  store.completeTask(cwd, task.id, "Done", undefined, "TestWorker", { dispatchToken: claimed?.dispatch_token });
   return store.getTask(cwd, task.id)!;
 }
 
@@ -183,7 +183,7 @@ describe("auto-review store operations", () => {
     const task = store.createTask(cwd, "No git task", "Desc");
     const claimed = store.claimTaskForDispatch(cwd, task.id, "TestWorker");
     store.startTask(cwd, task.id, "TestWorker", { dispatchToken: claimed?.dispatch_token });
-    store.completeTask(cwd, task.id, "Done", undefined, "TestWorker");
+    store.completeTask(cwd, task.id, "Done", undefined, "TestWorker", { dispatchToken: claimed?.dispatch_token });
 
     const loaded = store.getTask(cwd, task.id)!;
     expect(loaded.status).toBe("done");

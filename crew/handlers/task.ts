@@ -227,6 +227,49 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
     }
   }
 
+  // Accept the parent transition before creating anything: revalidate the
+  // exact instance/lifecycle snapshot under the guard. A claim or completion
+  // that landed since the snapshot is a refusal, never a takeover.
+  const expectedRev = task.rev ?? 0;
+  const accepted = store.mutateTask(cwd, id, current => {
+    if (current.id !== id || current.created_at !== task.created_at) return null;
+    if ((current.rev ?? 0) !== expectedRev) return null;
+    if (current.status !== task.status) return null;
+    if (current.status === "done" || current.milestone) return null;
+    if ((current.dispatch_token ?? undefined) !== (task.dispatch_token ?? undefined)) return null;
+    if ((current.assigned_to ?? undefined) !== (task.assigned_to ?? undefined)) return null;
+    if ((current.completed_at ?? undefined) !== (task.completed_at ?? undefined)) return null;
+    return {
+      milestone: true,
+      status: "todo",
+      started_at: undefined,
+      completed_at: undefined,
+      base_commit: undefined,
+      assigned_to: undefined,
+      summary: undefined,
+      evidence: undefined,
+      completed_by: undefined,
+      completed_dispatch: undefined,
+      dispatch_token: undefined,
+      blocked_reason: undefined,
+      role: undefined,
+      risk_labels: undefined,
+      approval: undefined,
+      generation: (current.generation ?? 0) + 1,
+    };
+  });
+  if (!accepted) {
+    return result(`Error: Task ${id} changed while splitting (claim, completion or edit landed); no subtasks were created. Re-run task.split.`, {
+      mode: "task.split",
+      error: "task_changed",
+      id,
+    });
+  }
+
+  if (task.status === "blocked") {
+    store.cleanupBlockFiles(cwd, id);
+  }
+
   const created: Task[] = [];
   for (const sub of subtasks) {
     const approval: Task["approval"] = task.approval?.required
@@ -253,40 +296,30 @@ The parent becomes a milestone that auto-completes when all subtasks are done.`;
     );
   }
 
-  if (task.status === "blocked") {
-    store.cleanupBlockFiles(cwd, id);
+  // The parent was accepted above; link the actual subtask ids under the same
+  // guard. A spec edit that landed meanwhile still blocks the spec overwrite
+  // below via the generation precondition.
+  const linked = store.mutateTask(cwd, id, current =>
+    current.milestone ? { depends_on: subtaskIds } : null
+  );
+  if (!linked) {
+    return result(`Error: Task ${id} changed while completing the split; subtasks ${subtaskIds.join(", ")} were created but the parent was not linked.`, {
+      mode: "task.split",
+      error: "split_not_committed",
+      id,
+      subtasks: created.map(t => ({ id: t.id, title: t.title })),
+    });
   }
 
-  // Split is a reopen + takeover: the guarded mutation re-checks that the task
-  // is still splittable and invalidates the dispatch/completion attribution.
-  store.mutateTask(cwd, id, current => {
-    if (current.status === "done" || current.milestone) return null;
-    return {
-      depends_on: subtaskIds,
-      milestone: true,
-      status: "todo",
-      started_at: undefined,
-      completed_at: undefined,
-      base_commit: undefined,
-      assigned_to: undefined,
-      summary: undefined,
-      evidence: undefined,
-      completed_by: undefined,
-      completed_dispatch: undefined,
-      dispatch_token: undefined,
-      blocked_reason: undefined,
-      role: undefined,
-      risk_labels: undefined,
-      approval: undefined,
-    };
+  const specWritten = store.setTaskSpec(cwd, id, `# ${task.title}\n\nMilestone: completes when ${subtaskIds.join(", ")} are done.\n`, {
+    expectedGeneration: accepted.generation ?? 0,
   });
-
-  store.setTaskSpec(cwd, id, `# ${task.title}\n\nMilestone: completes when ${subtaskIds.join(", ")} are done.\n`);
 
   logFeedEvent(cwd, state.agentName || "unknown", "task.split", id,
     `Split into ${created.length} subtasks: ${subtaskIds.join(", ")}`);
 
-  return result(`Split ${id} into ${created.length} subtasks`, {
+  const staleSpecNote = specWritten ? "" : " (parent spec left unchanged: a newer edit landed)";
+  return result(`Split ${id} into ${created.length} subtasks${staleSpecNote}`, {
     mode: "task.split",
     phase: "execute",
     parent: id,
@@ -582,7 +615,9 @@ function taskBlock(cwd: string, params: CrewParams, state: MessengerState) {
     return result("Error: reason required for task.block", { mode: "task.block", error: "missing_reason" });
   }
 
-  const actionResult = executeTaskAction(cwd, "block", id, state.agentName || "unknown", params.reason);
+  const actionResult = executeTaskAction(cwd, "block", id, state.agentName || "unknown", params.reason, {
+    dispatchToken: process.env.PI_CREW_DISPATCH || undefined,
+  });
   if (!actionResult.success || !actionResult.task) {
     return result(`Error: ${actionResult.message}`, {
       mode: "task.block",
@@ -619,7 +654,9 @@ function taskUnblock(cwd: string, params: CrewParams, state: MessengerState) {
     return result("Error: id required for task.unblock", { mode: "task.unblock", error: "missing_id" });
   }
 
-  const actionResult = executeTaskAction(cwd, "unblock", id, state.agentName || "unknown");
+  const actionResult = executeTaskAction(cwd, "unblock", id, state.agentName || "unknown", undefined, {
+    dispatchToken: process.env.PI_CREW_DISPATCH || undefined,
+  });
   if (!actionResult.success || !actionResult.task) {
     return result(`Error: ${actionResult.message}`, {
       mode: "task.unblock",
@@ -792,7 +829,9 @@ function taskReset(cwd: string, params: CrewParams, state: MessengerState) {
 
   const cascade = params.cascade ?? false;
   const action = cascade ? "cascade-reset" : "reset";
-  const actionResult = executeTaskAction(cwd, action, id, state.agentName || "unknown");
+  const actionResult = executeTaskAction(cwd, action, id, state.agentName || "unknown", undefined, {
+    dispatchToken: process.env.PI_CREW_DISPATCH || undefined,
+  });
   if (!actionResult.success) {
     return result(`Error: ${actionResult.message}`, {
       mode: "task.reset",

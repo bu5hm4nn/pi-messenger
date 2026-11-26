@@ -136,6 +136,13 @@ export default function piMessengerExtension(pi: ExtensionAPI) {
   // ===========================================================================
 
   function deliverMessage(msg: AgentMailMessage): void {
+    // Warm lobby workers are spawned before their task claim, so this trusted
+    // assignment field is how their extension learns the dispatch reservation
+    // for task.done/block/unblock/reset fencing. The model never types it.
+    if (msg.dispatchToken && msg.from === "crew-orchestrator" && process.env.PI_CREW_WORKER === "1") {
+      process.env.PI_CREW_DISPATCH = msg.dispatchToken;
+    }
+
     // Store in chat history (keyed by sender)
     let history = state.chatHistory.get(msg.from);
     if (!history) {

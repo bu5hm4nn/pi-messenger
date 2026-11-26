@@ -9,7 +9,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Dirs } from "../../lib.ts";
 import { generateMemorableName } from "../../lib.ts";
-import type { CrewParams, AppendEntryFn, ReviewFeedback } from "../types.ts";
+import type { CrewParams, AppendEntryFn, ReviewFeedback, Task } from "../types.ts";
 import { result } from "../utils/result.ts";
 import { resolveModel, spawnAgents } from "../agents.ts";
 import { loadCrewConfig } from "../utils/config.ts";
@@ -78,10 +78,18 @@ export async function execute(
     } else if (teamStore.taskPendingApproval(task)) {
       needsApproval.push(task);
     } else if (task.attempt_count >= config.work.maxAttemptsPerTask) {
-      store.blockTask(cwd, task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`);
-      store.appendTaskProgress(cwd, task.id, "system",
-        `Auto-blocked after ${task.attempt_count} attempts (max: ${config.work.maxAttemptsPerTask})`);
-      logFeedEvent(cwd, "crew", "task.block", task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`);
+      // Re-check under the guard: a reservation acquired between the ready-task
+      // snapshot and this write must survive instead of being clobbered.
+      const blocked = store.blockTask(cwd, task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`, {
+        expectedStatus: "todo",
+        requireNoDispatchToken: true,
+        minAttemptCount: config.work.maxAttemptsPerTask,
+      });
+      if (blocked) {
+        store.appendTaskProgress(cwd, task.id, "system",
+          `Auto-blocked after ${task.attempt_count} attempts (max: ${config.work.maxAttemptsPerTask})`);
+        logFeedEvent(cwd, "crew", "task.block", task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`);
+      }
     } else {
       readyTasks.push(task);
     }
@@ -144,28 +152,55 @@ export async function execute(
   // Assign tasks to lobby workers first (they're already running and warmed up)
   const prdLabel = store.getPlanLabel(plan);
   const lobbyAssigned = new Set<string>();
+  // Per-task launch failures while assigning to warm workers: excluded from
+  // the regular spawn queue and reported with the wave's failed receipts.
+  const lobbyLaunchFailed = new Set<string>();
   const lobbyWorkers = getAvailableLobbyWorkers(cwd);
   for (const lobbyWorker of lobbyWorkers) {
     const task = readyTasks.find(t => !lobbyAssigned.has(t.id));
     if (!task) break;
 
     // A lobby claim is a dispatch: it reserves the task, charges the attempt
-    // and is released again if delivery to the worker fails.
-    const claimed = store.claimTaskForDispatch(cwd, task.id, lobbyWorker.name, {
-      maxAttempts: config.work.maxAttemptsPerTask,
-    });
+    // and is released again if delivery to the worker fails. A guard timeout
+    // rejects only THIS task; the rest of the wave keeps launching.
+    let claimed: Task | null = null;
+    try {
+      claimed = store.claimTaskForDispatch(cwd, task.id, lobbyWorker.name, {
+        maxAttempts: config.work.maxAttemptsPerTask,
+      });
+    } catch (err) {
+      if (err instanceof store.TaskLockTimeoutError) {
+        store.appendTaskProgress(cwd, task.id, "system",
+          `Lobby dispatch claim timed out for ${task.id}: ${err.message}`);
+        lobbyLaunchFailed.add(task.id);
+        continue;
+      }
+      throw err;
+    }
     if (!claimed || !claimed.dispatch_token) continue;
     const dispatchToken = claimed.dispatch_token;
 
     const others = readyTasks.filter(t => t.id !== task.id);
     const prompt = buildWorkerPrompt(task, prdLabel, cwd, config, others, skills, teamStore.buildTeamPromptContext(cwd, task));
     const baseCommit = store.getBaseCommit(cwd); // git outside the guard
-    const started = store.startTask(cwd, task.id, lobbyWorker.name, { baseCommit, dispatchToken });
+    let started: Task | null = null;
+    try {
+      started = store.startTask(cwd, task.id, lobbyWorker.name, { baseCommit, dispatchToken });
+    } catch (err) {
+      if (err instanceof store.TaskLockTimeoutError) {
+        try { store.releaseDispatch(cwd, task.id, dispatchToken); } catch {}
+        store.appendTaskProgress(cwd, task.id, "system",
+          `Lobby dispatch start timed out for ${task.id}: ${err.message}`);
+        lobbyLaunchFailed.add(task.id);
+        continue;
+      }
+      throw err;
+    }
     if (!started) {
       store.releaseDispatch(cwd, task.id, dispatchToken);
       continue;
     }
-    if (!assignTaskToLobbyWorker(lobbyWorker, task.id, prompt, dirs.inbox)) {
+    if (!assignTaskToLobbyWorker(lobbyWorker, task.id, prompt, dirs.inbox, dispatchToken)) {
       store.exitAttempt(cwd, task.id, {
         owner: lobbyWorker.name,
         dispatchToken,
@@ -180,7 +215,7 @@ export async function execute(
   cleanupUnassignedAliveFiles(cwd);
 
   // Build prompts for remaining tasks — spawnAgents throttles via autonomousState.concurrency
-  const remainingTasks = readyTasks.filter(t => !lobbyAssigned.has(t.id));
+  const remainingTasks = readyTasks.filter(t => !lobbyAssigned.has(t.id) && !lobbyLaunchFailed.has(t.id));
   const teamRoles = teamStore.resolveRoles(cwd);
   const workerTasks = remainingTasks.map(task => {
     const roleName = teamStore.resolveRoleName(cwd, task.role);
@@ -248,6 +283,7 @@ export async function execute(
   const failed: string[] = [];
   const indeterminate: string[] = [];
   const blocked: string[] = [];
+  failed.push(...lobbyLaunchFailed);
   // Completed tasks whose completion is attributable to the receipt that
   // reported them. Only these enter auto-review; a different worker's done
   // record is still reported but must not be reset/blocked by this receipt's
@@ -317,6 +353,16 @@ export async function execute(
     if (r.skipped) {
       store.appendTaskProgress(cwd, taskId, "system",
         `Dispatch skipped: ${r.error ?? "task no longer claimable"}.`);
+      continue;
+    }
+
+    // A claim guard timeout is a typed per-task launch failure: this task was
+    // never reserved, so it is neither failed over nor mutated. Other workers
+    // in the batch have already been awaited and still drain below.
+    if (r.errorCode === "task_lock_timeout") {
+      store.appendTaskProgress(cwd, taskId, "system",
+        `Dispatch claim timed out: ${r.error ?? "task guard timeout"}`);
+      failed.push(taskId);
       continue;
     }
 
@@ -426,11 +472,13 @@ export async function execute(
         store.appendTaskProgress(cwd, taskId, "system", `Worker crashed: ${r.error ?? "Unknown error"}`);
         // The task is blocked, but the worker may still have landed work.
         appendIndeterminateNote(taskId, task, `Worker crashed: ${r.error ?? "Unknown error"}`);
-        store.blockTask(cwd, taskId, `Worker failed: ${r.error ?? "Unknown error"}`, {
+        const blockedTask = store.blockTask(cwd, taskId, `Worker failed: ${r.error ?? "Unknown error"}`, {
           owner: receiptOwner,
           dispatchToken: receiptToken,
         });
-        blocked.push(taskId);
+        // Report blocked only for the fenced write that actually committed.
+        if (blockedTask) blocked.push(taskId);
+        else noteStateChanged(taskId, receiptOwner);
       } else {
         if (task?.status === "in_progress") {
           store.appendTaskProgress(cwd, taskId, "system", `Worker failed: ${r.error ?? "Unknown error"}`);
@@ -491,8 +539,22 @@ export async function execute(
         if ((task.review_count ?? 0) >= config.review.maxIterations) continue;
 
         if (task.status === "blocked" || /duplicate/i.test(task.blocked_reason ?? "")) {
-          if (task.status !== "blocked") {
-            store.blockTask(cwd, taskId, task.blocked_reason ?? "Duplicate task");
+          const alreadyBlocked = task.status === "blocked";
+          // If the task was read as done, revalidate the completion attribution
+          // inside the blocking mutation: a newer completion must not be
+          // blocked by this receipt's stale duplicate marker.
+          const blockedTask = alreadyBlocked
+            ? null
+            : store.blockTask(cwd, taskId, task.blocked_reason ?? "Duplicate task", {
+              expectedStatus: "done",
+              ...(attribution.token !== undefined ? { completedDispatch: attribution.token } : {}),
+              ...(attribution.owner !== undefined ? { completedBy: attribution.owner } : {}),
+            });
+          if (!alreadyBlocked && !blockedTask) {
+            store.appendTaskProgress(cwd, taskId, "system",
+              `Auto-review duplicate skip discarded: completion is no longer attributed to ${attribution.owner ?? attribution.token ?? "this dispatch"}.`);
+            logFeedEvent(cwd, "crew", "task.review", taskId, "skipped — completion changed");
+            continue;
           }
           succeeded.splice(succeeded.indexOf(taskId), 1);
           blocked.push(taskId);

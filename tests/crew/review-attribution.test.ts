@@ -91,8 +91,8 @@ describe("auto-review completion attribution", () => {
 
     vi.mocked(agents.spawnAgents).mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       const workerA = tasks[0]?.workerName!;
-      store.claimTaskForDispatch(dirs.cwd, task.id, workerA);
-      store.startTask(dirs.cwd, task.id, workerA);
+      const claimedA = store.claimTaskForDispatch(dirs.cwd, task.id, workerA);
+      store.startTask(dirs.cwd, task.id, workerA, { dispatchToken: claimedA?.dispatch_token });
 
       // Worker B takes over in another process (explicit reset invalidates A's
       // reservation) and completes first.
@@ -102,7 +102,7 @@ describe("auto-review completion attribution", () => {
         baseCommit: "abc12345",
         dispatchToken: claimedB?.dispatch_token,
       });
-      store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB-bbbb");
+      store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB-bbbb", { dispatchToken: claimedB?.dispatch_token });
 
       // A's exit-0 receipt arrives late, so it is not attributable to the
       // current completion and must not trigger auto-review.
@@ -141,15 +141,20 @@ describe("auto-review completion attribution", () => {
   it("task.done persists the completing worker identity", async () => {
     const taskHandler = await import("../../crew/handlers/task.ts");
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
-    store.claimTaskForDispatch(dirs.cwd, task.id, "WorkerA-1234");
-    store.startTask(dirs.cwd, task.id, "WorkerA-1234");
-
-    const response = await taskHandler.execute(
-      "done",
-      { action: "task.done", id: task.id, summary: "Done" },
-      { agentName: "WorkerA-1234" } as MessengerState,
-      createMockContext(dirs.cwd),
-    );
+    const claimed = store.claimTaskForDispatch(dirs.cwd, task.id, "WorkerA-1234");
+    store.startTask(dirs.cwd, task.id, "WorkerA-1234", { dispatchToken: claimed?.dispatch_token });
+    process.env.PI_CREW_DISPATCH = claimed?.dispatch_token;
+    let response;
+    try {
+      response = await taskHandler.execute(
+        "done",
+        { action: "task.done", id: task.id, summary: "Done" },
+        { agentName: "WorkerA-1234" } as MessengerState,
+        createMockContext(dirs.cwd),
+      );
+    } finally {
+      delete process.env.PI_CREW_DISPATCH;
+    }
 
     expect(response.details.error).toBeUndefined();
     const after = store.getTask(dirs.cwd, task.id)!;
@@ -162,10 +167,10 @@ describe("auto-review completion attribution", () => {
 
     vi.mocked(agents.spawnAgents).mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       const workerA = tasks[0]?.workerName!;
-      store.claimTaskForDispatch(dirs.cwd, task.id, workerA);
-      store.startTask(dirs.cwd, task.id, workerA);
+      const claimedA = store.claimTaskForDispatch(dirs.cwd, task.id, workerA);
+      store.startTask(dirs.cwd, task.id, workerA, { dispatchToken: claimedA?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "abc12345" });
-      store.completeTask(dirs.cwd, task.id, "A landed", undefined, workerA);
+      store.completeTask(dirs.cwd, task.id, "A landed", undefined, workerA, { dispatchToken: claimedA?.dispatch_token });
       return [makeResult(task.id, workerA)];
     });
 
@@ -189,10 +194,10 @@ describe("auto-review completion attribution", () => {
 
     vi.mocked(agents.spawnAgents).mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       const workerA = tasks[0]?.workerName!;
-      store.claimTaskForDispatch(dirs.cwd, task.id, workerA);
-      store.startTask(dirs.cwd, task.id, workerA);
+      const claimedA = store.claimTaskForDispatch(dirs.cwd, task.id, workerA);
+      store.startTask(dirs.cwd, task.id, workerA, { dispatchToken: claimedA?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "abc12345" });
-      store.completeTask(dirs.cwd, task.id, "A landed", undefined, workerA);
+      store.completeTask(dirs.cwd, task.id, "A landed", undefined, workerA, { dispatchToken: claimedA?.dispatch_token });
       return [makeResult(task.id, workerA)];
     });
     vi.mocked(reviewHandler.reviewImplementation).mockImplementation(async () => {
@@ -204,7 +209,7 @@ describe("auto-review completion attribution", () => {
         baseCommit: "abc12345",
         dispatchToken: claimedB?.dispatch_token,
       });
-      store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB-bbbb");
+      store.completeTask(dirs.cwd, task.id, "B landed", undefined, "WorkerB-bbbb", { dispatchToken: claimedB?.dispatch_token });
       return {
         content: [{ type: "text", text: "Review" }],
         details: {

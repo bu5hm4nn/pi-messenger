@@ -6,7 +6,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { acquireDirMutex, releaseDirMutex } from "./dir-mutex.ts";
+import { acquireDirMutex, releaseDirMutex, tryAcquireDirMutex } from "./dir-mutex.ts";
 
 export type FeedEventType =
   | "join"
@@ -110,18 +110,20 @@ export function appendFeedEvent(cwd: string, event: FeedEvent): void {
 
     // Sequence allocation and the append are one critical section: two
     // processes appending in the same millisecond must not share a seq, or the
-    // overlay cursor would skip one of them.
-    let guard = null;
+    // overlay cursor would skip one of them. If the guard cannot be acquired,
+    // defer/drop this best-effort event: computing a seq without the lock could
+    // mint a duplicate identity.
+    let guard: ReturnType<typeof acquireDirMutex>;
     try {
       guard = acquireDirMutex(path.join(feedDir, ".feed-seq"), { timeoutMs: 2000 });
     } catch {
-      // Feed writes are best effort; fall through with a computed sequence.
+      return;
     }
     try {
       const sanitized = sanitizeFeedEvent({ ...event, seq: nextFeedSeq(cwd) });
       fs.appendFileSync(p, JSON.stringify(sanitized) + "\n");
     } finally {
-      if (guard) releaseDirMutex(guard);
+      releaseDirMutex(guard);
     }
   } catch {
     // Best effort
@@ -191,12 +193,23 @@ export function pruneFeed(cwd: string, maxEvents: number): void {
   if (!fs.existsSync(p)) return;
 
   try {
-    const content = fs.readFileSync(p, "utf-8").trim();
-    if (!content) return;
-    const lines = content.split("\n");
-    if (lines.length <= maxEvents) return;
-    const pruned = lines.slice(-maxEvents);
-    fs.writeFileSync(p, pruned.join("\n") + "\n");
+    // Prune must serialize with append on the same .feed-seq guard, otherwise
+    // a rewrite can erase an event that an appender just gave a fresh identity.
+    // On contention skip this prune entirely rather than writing unguarded.
+    const feedDir = path.dirname(p);
+    const guard = tryAcquireDirMutex(path.join(feedDir, ".feed-seq"));
+    if (!guard) return;
+
+    try {
+      const content = fs.readFileSync(p, "utf-8").trim();
+      if (!content) return;
+      const lines = content.split("\n");
+      if (lines.length <= maxEvents) return;
+      const pruned = lines.slice(-maxEvents);
+      fs.writeFileSync(p, pruned.join("\n") + "\n");
+    } finally {
+      releaseDirMutex(guard);
+    }
   } catch {
     // Best effort
   }

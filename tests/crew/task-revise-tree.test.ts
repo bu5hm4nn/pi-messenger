@@ -115,6 +115,51 @@ describe("executeReviseTree", () => {
     expect(store.getTask(tmpDir, t3.id)?.status).toBe("todo");
   });
 
+  it("does not reset a task claimed after the tree-revision snapshot", async () => {
+    const t1 = store.createTask(tmpDir, "Root", "root spec");
+    const t2 = store.createTask(tmpDir, "Child", "child spec", [t1.id]);
+
+    spawnAgents.mockResolvedValue([{
+      exitCode: 0,
+      output: `\`\`\`tasks-json
+[
+  {"id": "${t2.id}", "title": "Child", "spec": "revised child spec", "dependsOn": ["${t1.id}"]}
+]
+\`\`\``,
+      error: null,
+      progress: { toolCallCount: 0, tokens: 0 },
+    }]);
+
+    const originalReset = store.resetTask.bind(store);
+    let claimed = false;
+    const resetSpy = vi.spyOn(store, "resetTask").mockImplementation(((
+      taskCwd: string,
+      taskId: string,
+      cascade?: boolean,
+      options?: Parameters<typeof store.resetTask>[3],
+    ) => {
+      if (!claimed && taskId === t2.id) {
+        claimed = true;
+        // A dispatch claims the task after the snapshot but before its reset.
+        store.claimTaskForDispatch(taskCwd, taskId, "LateWorker");
+      }
+      return originalReset(taskCwd, taskId, cascade, options);
+    }) as typeof store.resetTask);
+
+    try {
+      const r = await executeReviseTree(tmpDir, t1.id, undefined, "agent");
+      expect(r.success).toBe(true);
+    } finally {
+      resetSpy.mockRestore();
+    }
+
+    const after = store.getTask(tmpDir, t2.id)!;
+    expect(after.status).toBe("todo");
+    expect(after.dispatch_token).toBeTruthy();
+    expect(after.assigned_to).toBe("LateWorker");
+    expect(store.getTaskProgress(tmpDir, t2.id) ?? "").toContain("claimed or completed after the snapshot");
+  });
+
   it("creates new tasks from entries without id", async () => {
     const t1 = store.createTask(tmpDir, "Root", "spec");
     const t2 = store.createTask(tmpDir, "Child", "spec", [t1.id]);

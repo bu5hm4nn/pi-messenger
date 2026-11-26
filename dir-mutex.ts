@@ -15,11 +15,16 @@
  * directory if (and only if) it is empty. A guard with a successor marker is
  * left alone: the successor owns it now.
  *
- * Reclaim requires *verified death*: the observed marker must belong to this
- * host, parse as a pid, and `process.kill(pid, 0)` must fail with ESRCH. Every
- * other outcome (EPERM, unknown host, unparseable marker) means ALIVE. There
- * is no age-based stealing: a paused-but-alive holder must never lose the
- * lock, because that would allow overlapping read-modify-write.
+ * Reclaim requires *verified death*: the guard must contain exactly one
+ * marker, it must belong to this host, parse as a canonical pid, and
+ * `process.kill(pid, 0)` must fail with ESRCH. Every other outcome (EPERM,
+ * unknown host, unparseable/malformed marker, zero or multiple markers) means
+ * ALIVE. There is no age-based stealing: a paused-but-alive holder must never
+ * lose the lock, because that would allow overlapping read-modify-write.
+ *
+ * Shared boards across PID namespaces (containers) are explicitly unsupported,
+ * alongside network shares: host/pid identity from another namespace cannot
+ * prove liveness here, so such markers are always treated as ALIVE.
  */
 
 import * as fs from "node:fs";
@@ -91,19 +96,23 @@ export interface ParsedMarker {
 }
 
 /**
- * Parse `<hostname>-<pid>-<uuid>`. Hostnames may contain dashes, so the uuid
- * (fixed width, at the end) anchors the split and the pid is the numeric
- * segment immediately before it.
+ * Parse the exact `<hostname>-<pid>-<uuid>` format. Hostnames may contain
+ * dashes, so the fixed-width uuid anchors the split and the pid is the
+ * canonical decimal segment immediately before it. Anything else is
+ * unparseable and must be treated as ALIVE by reclaim.
  */
 export function parseMarkerName(name: string): ParsedMarker | null {
   if (name.length < 36 + 3) return null;
   const uuid = name.slice(-36);
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(uuid)) return null;
+  if (!/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(uuid)) return null;
   const rest = name.slice(0, -(36 + 1));
   const dash = rest.lastIndexOf("-");
   if (dash <= 0) return null;
-  const pid = Number(rest.slice(dash + 1));
-  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const pidText = rest.slice(dash + 1);
+  // Canonical positive decimal pid: no sign, spaces, leading zeroes or "1e3".
+  if (!/^[1-9][0-9]*$/.test(pidText)) return null;
+  const pid = Number(pidText);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   return { host: rest.slice(0, dash), pid };
 }
 
@@ -161,20 +170,22 @@ export function tryReclaimDirMutex(guardPath: string): boolean {
     // may remove it.
     return removeEmptyGuard(guardPath);
   }
+  // Death-based reclaim is only safe for the single-marker invariant. A
+  // malformed or multi-marker guard could hide a live holder, so it is ALIVE.
+  if (state.markers.length !== 1) return false;
 
+  const marker = state.markers[0];
   const host = os.hostname();
-  for (const marker of state.markers) {
-    const parsed = parseMarkerName(marker);
-    if (!parsed) return false;
-    if (parsed.host !== host) return false;
-    if (probeLiveness(parsed.pid) !== "dead") return false;
-    try {
-      fs.unlinkSync(path.join(guardPath, marker));
-    } catch (err) {
-      // ENOENT: another reclaimer already removed this marker. Any other
-      // error means we could not prove ownership; leave the guard alone.
-      return false;
-    }
+  const parsed = parseMarkerName(marker);
+  if (!parsed) return false;
+  if (parsed.host !== host) return false;
+  if (probeLiveness(parsed.pid) !== "dead") return false;
+  try {
+    fs.unlinkSync(path.join(guardPath, marker));
+  } catch {
+    // ENOENT: another reclaimer already removed the marker. Any other error
+    // means we could not prove ownership; leave the guard alone either way.
+    return false;
   }
 
   return removeEmptyGuard(guardPath);
@@ -228,6 +239,7 @@ export class DirMutexTimeoutError extends Error {
 function isRetryableContention(code: string | undefined): boolean {
   if (code === "EEXIST" || code === "ENOTEMPTY" || code === "EPERM" || code === "EACCES") return true;
   // Windows reports a delete-pending directory as EBUSY; it clears on its own.
+  // Implemented for Windows, but not validated on this Linux host.
   return process.platform === "win32" && (code === "EBUSY" || code === "EACCES");
 }
 

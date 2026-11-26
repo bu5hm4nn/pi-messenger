@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { appendFeedEvent, formatFeedLine, isCrewEvent, logFeedEvent, pruneFeed, readFeedEvents } from "../feed.ts";
+import { acquireDirMutex, releaseDirMutex } from "../dir-mutex.ts";
 import { createTempCrewDirs } from "./helpers/temp-dirs.ts";
 
 describe("feed", () => {
@@ -91,6 +92,36 @@ describe("feed", () => {
     expect(events).toHaveLength(2);
     expect(events.map(e => e.type)).toEqual(["edit", "test"]);
     expect(events[0]?.target).toBe("b.ts");
+  });
+
+  it("does not prune while an append holds the feed-sequence guard", () => {
+    logFeedEvent(cwd, "AgentOne", "join");
+    logFeedEvent(cwd, "AgentOne", "edit", "a.ts");
+    logFeedEvent(cwd, "AgentOne", "edit", "b.ts");
+    logFeedEvent(cwd, "AgentOne", "test", undefined, "passed");
+
+    const feedFile = path.join(cwd, ".pi", "messenger", "feed.jsonl");
+    const guard = acquireDirMutex(path.join(path.dirname(feedFile), ".feed-seq"));
+    try {
+      // Contention means skip this prune; it must not rewrite unguarded.
+      pruneFeed(cwd, 1);
+    } finally {
+      releaseDirMutex(guard);
+    }
+    expect(readFeedEvents(cwd, 20)).toHaveLength(4);
+
+    // A later append keeps its own identity and a guarded prune preserves it.
+    appendFeedEvent(cwd, {
+      ts: new Date().toISOString(),
+      agent: "AgentOne",
+      type: "task.done",
+      target: "task-1",
+    });
+    pruneFeed(cwd, 2);
+    const events = readFeedEvents(cwd, 20);
+    expect(events).toHaveLength(2);
+    expect(events.map(event => event.seq)).toEqual([4, 5]);
+    expect(events[1]?.target).toBe("task-1");
   });
 
   it("formats planning events with previews and marks them as crew events", () => {

@@ -244,9 +244,28 @@ export async function executeReviseTree(
   }
 
   for (const task of revisable) {
-    // Takeover through the lifecycle mutation: clears completion attribution
-    // and invalidates any active dispatch token.
-    store.resetTask(cwd, task.id);
+    // Revalidate the lifecycle snapshot captured before the planner ran: spec
+    // edits may have bumped generation/rev, but a task claimed or completed
+    // since then must be skipped, never reset as a takeover.
+    const reset = store.resetTask(cwd, task.id, false, {
+      expectedLifecycle: {
+        status: task.status,
+        createdAt: task.created_at,
+        assignedTo: task.assigned_to,
+        dispatchToken: task.dispatch_token,
+        completedAt: task.completed_at,
+        completedDispatch: task.completed_dispatch,
+      },
+    });
+    if (reset.length === 0) {
+      const current = store.getTask(cwd, task.id);
+      store.appendTaskProgress(
+        cwd,
+        current ? task.id : taskId,
+        "system",
+        `Tree revision skipped reset of ${task.id}: it was claimed or completed after the snapshot; left untouched.`,
+      );
+    }
   }
 
   const preview = prompt ? prompt.slice(0, 60) : "revised tree";

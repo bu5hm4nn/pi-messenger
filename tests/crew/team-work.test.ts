@@ -146,7 +146,7 @@ describe("work with Team approval", () => {
     vi.mocked(agents.spawnAgents).mockImplementation(async () => {
       const claimed = store.claimTaskForDispatch(cwd, first.id, "crew-worker");
       store.startTask(cwd, first.id, "crew-worker", { dispatchToken: claimed?.dispatch_token });
-      store.completeTask(cwd, first.id, "Done", undefined, "crew-worker");
+      store.completeTask(cwd, first.id, "Done", undefined, "crew-worker", { dispatchToken: claimed?.dispatch_token });
       return [{ exitCode: 0, output: "done", truncated: false, progress: { toolCallCount: 0, tokens: 0 }, agent: "crew-worker", taskId: first.id }];
     });
 

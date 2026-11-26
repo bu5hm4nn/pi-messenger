@@ -34,6 +34,8 @@ export interface CrewViewState {
   notification: { message: string; expiresAt: number } | null;
   /** Flashes that arrived while another was visible; shown one at a time. */
   pendingNotifications: string[];
+  /** Parallel kind flags: true for crew.idle, which ordinary overflow never evicts. */
+  pendingNotificationsIdle: boolean[];
   notificationTimer: ReturnType<typeof setTimeout> | null;
   feedFocus: boolean;
   mentionCandidates: string[];
@@ -56,6 +58,7 @@ export function createCrewViewState(): CrewViewState {
     lastSeenEventSeq: null,
     notification: null,
     pendingNotifications: [],
+    pendingNotificationsIdle: [],
     notificationTimer: null,
     feedFocus: false,
     mentionCandidates: [],
@@ -103,10 +106,12 @@ function showNotification(viewState: CrewViewState, tui: TUI, message: string): 
     viewState.notificationTimer = null;
     const next = viewState.pendingNotifications.shift();
     if (next) {
+      viewState.pendingNotificationsIdle.shift();
       showNotification(viewState, tui, next);
       tui.requestRender();
       return;
     }
+    viewState.pendingNotificationsIdle.shift();
     tui.requestRender();
   }, 2000);
 }
@@ -117,6 +122,7 @@ export function setNotification(
   success: boolean,
   message: string,
   queueIfBusy = false,
+  idle = false,
 ): void {
   const text = `${success ? "✓" : "✗"} ${message}`;
   if (queueIfBusy && viewState.notification && Date.now() < viewState.notification.expiresAt) {
@@ -124,6 +130,25 @@ export function setNotification(
     // one instead of overwriting (or collapsing into) the visible flash.
     if (viewState.pendingNotifications.length < 10) {
       viewState.pendingNotifications.push(text);
+      viewState.pendingNotificationsIdle.push(idle);
+      return;
+    }
+
+    // Overflow policy: drop the oldest ORDINARY pending flash. An unseen
+    // crew.idle flash is never evicted; if every pending flash is idle, an
+    // entering idle is still appended (the queue may grow), while an ordinary
+    // incoming flash is dropped rather than displacing idle.
+    const ordinaryIndex = viewState.pendingNotificationsIdle.indexOf(false);
+    if (ordinaryIndex !== -1) {
+      viewState.pendingNotifications.splice(ordinaryIndex, 1);
+      viewState.pendingNotificationsIdle.splice(ordinaryIndex, 1);
+      viewState.pendingNotifications.push(text);
+      viewState.pendingNotificationsIdle.push(idle);
+      return;
+    }
+    if (idle) {
+      viewState.pendingNotifications.push(text);
+      viewState.pendingNotificationsIdle.push(true);
     }
     return;
   }

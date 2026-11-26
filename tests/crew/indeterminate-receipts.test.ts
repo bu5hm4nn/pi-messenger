@@ -112,8 +112,8 @@ describe("crew/indeterminate receipts and crew idle", () => {
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
         if (t.taskId) {
-          store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
-          store.startTask(dirs.cwd, t.taskId, t.workerName!);
+          const claimed = store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
+          store.startTask(dirs.cwd, t.taskId, t.workerName!, { dispatchToken: claimed?.dispatch_token });
         }
       }
       return tasks.map(t => makeResult(t.taskId!, 0, { workerName: t.workerName }));
@@ -149,8 +149,8 @@ describe("crew/indeterminate receipts and crew idle", () => {
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
         if (t.taskId) {
-          store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
-          store.startTask(dirs.cwd, t.taskId, t.workerName!);
+          const claimed = store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
+          store.startTask(dirs.cwd, t.taskId, t.workerName!, { dispatchToken: claimed?.dispatch_token });
         }
       }
       return tasks.map(t => makeResult(t.taskId!, 1, { error: "crashed", workerName: t.workerName }));
@@ -217,7 +217,7 @@ describe("crew/indeterminate receipts and crew idle", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
 
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+    const spawnSpy = vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
         if (t.taskId) store.claimTaskForDispatch(dirs.cwd, t.taskId, t.workerName!);
       }
@@ -250,6 +250,8 @@ describe("crew/indeterminate receipts and crew idle", () => {
     expect(reloaded?.status).toBe("blocked");
     expect(reloaded?.attempt_count).toBe(1);
     expect(wave2.details.blocked ?? []).toEqual([task.id]);
+    // The cap=1 boundary must not launch (or even call spawnAgents for) wave 2.
+    expect(spawnSpy).toHaveBeenCalledTimes(1);
   });
 
   it("stale result leaves a re-claimed in_progress task untouched and the new owner's task.done succeeds", async () => {
@@ -263,22 +265,24 @@ describe("crew/indeterminate receipts and crew idle", () => {
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
 
     let waveAWorker: string | undefined;
+    let waveBToken: string | undefined;
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       waveAWorker = tasks[0]?.workerName;
       expect(waveAWorker).toBeTruthy();
       // Ownership is recorded at launch, not while the queue is built.
       expect(store.getTask(dirs.cwd, task.id)?.assigned_to).toBeUndefined();
-      store.claimTaskForDispatch(dirs.cwd, task.id, waveAWorker!);
+      const claimedA = store.claimTaskForDispatch(dirs.cwd, task.id, waveAWorker!);
       expect(store.getTask(dirs.cwd, task.id)?.assigned_to).toBe(waveAWorker);
 
       // Wave A claims the task via task.start, then exits without task.done.
-      store.startTask(dirs.cwd, task.id, waveAWorker!);
+      store.startTask(dirs.cwd, task.id, waveAWorker!, { dispatchToken: claimedA?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "aaa1111" });
 
       // Before A's receipt is classified, wave B takes the task over (explicit
       // reset clears A's reservation), re-claims and starts it.
       store.resetTask(dirs.cwd, task.id);
       const claimedB = store.claimTaskForDispatch(dirs.cwd, task.id, "WaveBWorker");
+      waveBToken = claimedB?.dispatch_token;
       store.startTask(dirs.cwd, task.id, "WaveBWorker", { dispatchToken: claimedB?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "bbb2222" });
 
@@ -308,13 +312,20 @@ describe("crew/indeterminate receipts and crew idle", () => {
     expect(response.details.indeterminate ?? []).toEqual([]);
 
     // The orphaned-completion scenario: B can still finish because the stale
-    // receipt did not reset the task out of in_progress.
-    const done = await taskHandler.execute(
-      "done",
-      { action: "task.done", id: task.id, summary: "Wave B landed" },
-      { agentName: "WaveBWorker" } as MessengerState,
-      createMockContext(dirs.cwd),
-    );
+    // receipt did not reset the task out of in_progress. B's worker session
+    // carries its own dispatch token in the environment.
+    process.env.PI_CREW_DISPATCH = waveBToken;
+    let done;
+    try {
+      done = await taskHandler.execute(
+        "done",
+        { action: "task.done", id: task.id, summary: "Wave B landed" },
+        { agentName: "WaveBWorker" } as MessengerState,
+        createMockContext(dirs.cwd),
+      );
+    } finally {
+      delete process.env.PI_CREW_DISPATCH;
+    }
     expect(done.details.error).toBeUndefined();
     expect(store.getTask(dirs.cwd, task.id)?.status).toBe("done");
   });
@@ -504,8 +515,8 @@ describe("crew/indeterminate receipts and crew idle", () => {
       expect(waveAWorker).toMatch(/^SwiftArrow-[0-9a-f]{4}$/);
 
       // Wave A launches and claims the task.
-      store.claimTaskForDispatch(dirs.cwd, task.id, waveAWorker!);
-      store.startTask(dirs.cwd, task.id, waveAWorker!);
+      const claimedA = store.claimTaskForDispatch(dirs.cwd, task.id, waveAWorker!);
+      store.startTask(dirs.cwd, task.id, waveAWorker!, { dispatchToken: claimedA?.dispatch_token });
 
       // Wave B re-draws the same memorable name but has its own suffix.
       const waveBWorker = "SwiftArrow-bbbb";
@@ -553,8 +564,8 @@ describe("crew/indeterminate receipts and crew idle", () => {
     let owner: string | undefined;
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       owner = tasks[0]?.workerName!;
-      store.claimTaskForDispatch(dirs.cwd, task.id, owner);
-      store.startTask(dirs.cwd, task.id, owner);
+      const claimed = store.claimTaskForDispatch(dirs.cwd, task.id, owner);
+      store.startTask(dirs.cwd, task.id, owner, { dispatchToken: claimed?.dispatch_token });
       // Legacy/foreign receipt: no workerName, so it cannot be attributed.
       return [makeResult(task.id, 0)];
     });
@@ -595,8 +606,8 @@ describe("crew/indeterminate receipts and crew idle", () => {
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       const workerName = tasks[0]?.workerName!;
-      store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
-      store.startTask(dirs.cwd, task.id, workerName);
+      const claimed = store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
+      store.startTask(dirs.cwd, task.id, workerName, { dispatchToken: claimed?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "feedface" });
       return [makeResult(task.id, 0, { workerName })];
     });
@@ -635,8 +646,8 @@ describe("crew/indeterminate receipts and crew idle", () => {
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       const workerName = tasks[0]?.workerName!;
-      store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
-      store.startTask(dirs.cwd, task.id, workerName);
+      const claimed = store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
+      store.startTask(dirs.cwd, task.id, workerName, { dispatchToken: claimed?.dispatch_token });
       store.updateTask(dirs.cwd, task.id, { base_commit: "feedface" });
       return [makeResult(task.id, 1, { error: "boom", workerName })];
     });

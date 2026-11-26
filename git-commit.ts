@@ -66,7 +66,7 @@ export interface CommitFeedDecision {
  * What a bounded git probe asks. The probe counter below reports these kinds; the calls
  * themselves stay private and synchronous.
  */
-export type GitProbeKind = "head" | "work-tree" | "reflog";
+export type GitProbeKind = "head" | "rev-parse-verify" | "work-tree" | "reflog";
 
 const GIT_TIMEOUT_MS = 2000;
 
@@ -79,6 +79,7 @@ const GIT_TIMEOUT_MS = 2000;
 const COMMIT_REFLOG_SUBJECT = /^commit( \((amend|initial|merge|cherry-pick|rebase)\))?:/;
 
 let probeCounter: ((kind: GitProbeKind) => void) | undefined;
+let probeFailureInjector: ((kind: GitProbeKind) => boolean) | undefined;
 
 /**
  * Test seam: observe the git probes this module issues. Production leaves it unset, so
@@ -89,8 +90,23 @@ export function setGitProbeCounter(counter: ((kind: GitProbeKind) => void) | und
   probeCounter = counter;
 }
 
+/**
+ * Test seam: make the next probe of a kind fail with a synthetic non-timeout error, so
+ * the probe's own catch path runs exactly as it would for a transient git failure. Like
+ * the counter it is unset in production, where the only cost is one `undefined` check.
+ */
+export function setGitProbeFailureInjector(
+  injector: ((kind: GitProbeKind) => boolean) | undefined,
+): void {
+  probeFailureInjector = injector;
+}
+
 function countProbe(kind: GitProbeKind): void {
   probeCounter?.(kind);
+}
+
+function failProbeIfInjected(kind: GitProbeKind): void {
+  if (probeFailureInjector?.(kind)) throw new Error(`injected git probe failure: ${kind}`);
 }
 
 /** Same semantics as the previous `isGitCommit` in index.ts. */
@@ -101,8 +117,9 @@ export function isGitCommitCommand(command: string): boolean {
 /**
  * Result of one bounded HEAD probe:
  * - `head` — a real state, possibly `UNBORN_HEAD` for a repository without commits,
- * - `not-a-repository` — cwd is not a work tree (also what a missing git answers),
- * - `unreadable` — timeout or malformed output; it proves nothing and never emits.
+ * - `not-a-repository` — a confirmed work-tree probe says cwd is not a work tree,
+ * - `unreadable` — timeout, malformed output, or a transient probe failure; it proves
+ *   nothing and never emits.
  */
 export type HeadProbe =
   | { kind: "head"; state: HeadState }
@@ -113,6 +130,7 @@ export type HeadProbe =
 export function probeHead(cwd: string): HeadProbe {
   try {
     countProbe("head");
+    failProbeIfInjected("head");
     // NUL-separated so a subject containing spaces or punctuation stays intact.
     const raw = execSync("git log -1 --format=%H%x00%h%x00%s", {
       cwd,
@@ -127,11 +145,23 @@ export function probeHead(cwd: string): HeadProbe {
       state: { sha: sha.trim(), shortSha: shortSha.trim(), subject: (subject ?? "").trim() },
     };
   } catch (error) {
-    // A timed-out read says nothing about HEAD, so it stays unreadable. Paying the second
-    // call here could mislabel a real repository as "unborn" and invent an event later.
+    // A timed-out read says nothing about HEAD, so it stays unreadable. The same reasoning
+    // applies to every other failure: believing `git log` would let a transient failure in
+    // a born repository be remembered as UNBORN_HEAD, and the next successful read of the
+    // unchanged HEAD would pass the transition check and invent a commit event.
     if (isTimeoutError(error)) return { kind: "unreadable" };
-    // `git log` fails both outside a repository and in one whose HEAD is unborn.
-    return isInsideWorkTree(cwd)
+    // `git log` also fails in a genuine unborn repository and outside a repository. Ask
+    // whether HEAD itself names a commit before believing the log failure: a readable SHA
+    // proves the repository is born, so the log read was transient and must stay
+    // unreadable (never remembered as unborn).
+    const headEvidence = probeVerifyHead(cwd);
+    if (headEvidence !== "unborn") return { kind: "unreadable" };
+    // HEAD does not resolve, so cwd is either an unborn repository or not a work tree.
+    // Only a confirmed work-tree answer may be remembered; a failed work-tree probe
+    // proves nothing and must not fabricate either state.
+    const workTree = probeWorkTree(cwd);
+    if (workTree === "probe-error") return { kind: "unreadable" };
+    return workTree === "inside"
       ? { kind: "head", state: UNBORN_HEAD }
       : { kind: "not-a-repository" };
   }
@@ -153,21 +183,80 @@ function isTimeoutError(error: unknown): boolean {
 }
 
 /**
- * Second bounded call, paid only on the `git log` failure path, to tell an unborn HEAD
- * apart from "not a repository". Returns false for bare repositories and for any error.
+ * git's own answer that no repository was found: exit 128 with the plumbing's definitive
+ * "not a git repository" diagnostic. This is a confirmed outside answer, not a failed
+ * probe. Any other failure (EMFILE, a spawn error, an unreadable/corrupt repository) must
+ * not be mistaken for it, or the sentinel would be fabricated and a later read could
+ * announce a false first commit.
  */
-function isInsideWorkTree(cwd: string): boolean {
+function isNotARepositoryError(error: unknown): boolean {
+  const { status, stderr } = (error ?? {}) as { status?: unknown; stderr?: unknown };
+  if (status !== 128) return false;
+  const text = typeof stderr === "string" ? stderr : Buffer.isBuffer(stderr) ? stderr.toString("utf-8") : "";
+  return /not a git repository/i.test(text);
+}
+
+/**
+ * What the `git rev-parse --verify -q HEAD` probe proved. `born` means HEAD resolves to a
+ * commit, so a preceding `git log` failure was transient. `unborn` is git's definite "no
+ * such ref" answer (an unborn HEAD or no repository). `probe-error` means the probe itself
+ * failed, which proves nothing and must fail closed.
+ */
+type HeadEvidence = "born" | "unborn" | "probe-error";
+
+/** Bounded call that tests whether HEAD resolves to a commit. Paid only on log failure. */
+function probeVerifyHead(cwd: string): HeadEvidence {
   try {
-    countProbe("work-tree");
-    const out = execSync("git rev-parse --is-inside-work-tree", {
+    countProbe("rev-parse-verify");
+    failProbeIfInjected("rev-parse-verify");
+    const out = execSync("git rev-parse --verify -q HEAD", {
       cwd,
       encoding: "utf-8",
       timeout: GIT_TIMEOUT_MS,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    return out.trim() === "true";
-  } catch {
-    return false;
+    // A successful verify prints the SHA. Exit 0 with no output is malformed: fail closed.
+    return out.trim() ? "born" : "probe-error";
+  } catch (error) {
+    if (isTimeoutError(error)) return "probe-error";
+    // A plain nonzero exit is git's answer that the ref does not resolve. Anything else
+    // (spawn failure, unreadable result) proves nothing.
+    const { status } = (error ?? {}) as { status?: unknown };
+    return typeof status === "number" && status !== 0 ? "unborn" : "probe-error";
+  }
+}
+
+/**
+ * What `git rev-parse --is-inside-work-tree` learned: a confirmed answer, or a failed
+ * probe. A failure must never be folded into "outside": doing so fabricates a
+ * not-a-repository marker and lets the next successful read announce a false first commit.
+ */
+type WorkTreeProbe = "inside" | "outside" | "probe-error";
+
+/** Third bounded call, paid only when HEAD does not resolve, to classify cwd. */
+function probeWorkTree(cwd: string): WorkTreeProbe {
+  try {
+    countProbe("work-tree");
+    failProbeIfInjected("work-tree");
+    const out = execSync("git rev-parse --is-inside-work-tree", {
+      cwd,
+      encoding: "utf-8",
+      timeout: GIT_TIMEOUT_MS,
+      stdio: ["pipe", "pipe", "pipe"],
+      // The catch below matches git's plumbing diagnostic to tell a confirmed "outside"
+      // from a failed probe; pin its locale so a translated message cannot silently turn
+      // a genuine non-repository into "unreadable".
+      env: { ...process.env, LC_ALL: "C" },
+    });
+    // "false" is a confirmed answer (a bare repository is not a work tree).
+    return out.trim() === "true" ? "inside" : "outside";
+  } catch (error) {
+    // git's definitive "not a git repository" is also a confirmed outside answer; it is
+    // what preserves the sentinel for a directory that is not a repository yet.
+    if (isNotARepositoryError(error)) return "outside";
+    // Timeout, missing git, or a transient spawn/read failure: no answer at all. Folding
+    // this into "outside" would fabricate the sentinel and invent a first commit later.
+    return "probe-error";
   }
 }
 
@@ -179,6 +268,7 @@ function isInsideWorkTree(cwd: string): boolean {
 export function readHeadReflog(cwd: string): HeadReflogEntry | undefined {
   try {
     countProbe("reflog");
+    failProbeIfInjected("reflog");
     // %H is the commit the entry points at; %gs is the operation that wrote it, e.g.
     // `commit: subject` or `checkout: moving from main to feature`.
     const raw = execSync("git reflog -1 --format=%H%x00%gs", {
@@ -236,7 +326,8 @@ export class CommitHeadTracker {
 /**
  * tool_call side of the hook: remember the pre-call HEAD for this tool call. A cwd that is
  * not a repository yet is remembered as NOT_A_REPOSITORY, because the same bash call may
- * run `git init` and commit; a timed-out read is not remembered at all (fail closed).
+ * run `git init` and commit; an unreadable read (timeout or a transient probe failure) is
+ * not remembered at all, so no later successful read can turn it into a false event.
  */
 export function rememberHeadBeforeCall(
   tracker: CommitHeadTracker,
@@ -272,7 +363,9 @@ function normalizeHeadBefore(snapshot: HeadSnapshot | undefined): HeadState | un
 /**
  * Pure pre-check: could these two snapshots describe a commit landing? A remembered
  * `NOT_A_REPOSITORY` counts as unborn, so `no repository -> real SHA` is a transition; a
- * missing (unreadable) side never is. The reflog gate decides the rest.
+ * missing (unreadable) side never is. A real HEAD that becomes unborn is HEAD destruction
+ * (an orphan checkout, `update-ref -d`), never a commit, so it is rejected here before the
+ * caller pays for a reflog probe. The reflog gate decides the rest.
  */
 export function hasHeadTransition(input: {
   headBefore?: HeadSnapshot;
@@ -280,6 +373,9 @@ export function hasHeadTransition(input: {
 }): boolean {
   const headBefore = normalizeHeadBefore(input.headBefore);
   if (!headBefore || !input.headAfter) return false;
+  // Real SHA -> UNBORN_HEAD destroys HEAD; it cannot be the commit being announced. The
+  // opposite direction, "" -> real, stays a candidate: it is the repository's first commit.
+  if (headBefore.sha !== "" && input.headAfter.sha === "") return false;
   return headBefore.sha !== input.headAfter.sha;
 }
 
@@ -292,8 +388,10 @@ export function hasHeadTransition(input: {
  * An unborn `headBefore` (empty `sha`, i.e. `UNBORN_HEAD`) is a real state, not a missing
  * one: `"" -> <real sha>` is the repository's first commit and deserves the event, while
  * `"" -> ""` means the first commit failed and stays silent. The same holds for a call
- * that started in a directory which was not a repository yet. A missing state
- * (`undefined`) is unreadable, so it never produces an event.
+ * that started in a directory which was not a repository yet. The opposite move, a real
+ * SHA -> unborn, destroys HEAD (an orphan checkout, `update-ref -d`) and is rejected by
+ * `hasHeadTransition` before the reflog probe. A missing state (`undefined`) is unreadable,
+ * so it never produces an event.
  *
  * Do not replace the reflog check with a parent/ancestry check. That was tested
  * empirically and does not discriminate: with main=A and a feature branch whose tip is a

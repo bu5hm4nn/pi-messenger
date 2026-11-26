@@ -18,7 +18,9 @@ import {
   readHeadState,
   rememberHeadBeforeCall,
   setGitProbeCounter,
+  setGitProbeFailureInjector,
   type GitProbeKind,
+  type HeadProbe,
   type HeadReflogEntry,
   type HeadState,
 } from "../git-commit.ts";
@@ -66,6 +68,7 @@ afterAll(() => {
 
 afterEach(() => {
   setGitProbeCounter(undefined);
+  setGitProbeFailureInjector(undefined);
 });
 
 /** Run a shell command; inherits the sanitized process env, like the production readers. */
@@ -112,6 +115,21 @@ function recordProbes(fn: () => void): GitProbeKind[] {
     setGitProbeCounter(undefined);
   }
   return probes;
+}
+
+/** Make the next probe of `kind` fail with a synthetic non-timeout error. */
+function failNextProbe(kind: GitProbeKind): void {
+  let pending = 1;
+  setGitProbeFailureInjector(probed => {
+    if (probed !== kind || pending === 0) return false;
+    pending -= 1;
+    return true;
+  });
+}
+
+/** Make every probe of `kind` fail with a synthetic non-timeout error. */
+function failProbe(kind: GitProbeKind): void {
+  setGitProbeFailureInjector(probed => probed === kind);
 }
 
 /** Mirror of the hook's feed side effect: only a decision writes a commit event. */
@@ -205,6 +223,20 @@ describe("decideCommitEvent", () => {
     // An unreadable headBefore is not the same claim as an unborn one: stay silent
     expect(
       decideCommitEvent({ headBefore: undefined, headAfter: UNBORN_HEAD, newestReflog: undefined }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined when a real HEAD becomes unborn", () => {
+    // An orphan checkout or `update-ref -d` destroys HEAD; it is never a commit. Even a
+    // commit-looking reflog entry must not turn it into an event.
+    const before = head("a".repeat(40), "aaaaaaa", "init");
+
+    expect(
+      decideCommitEvent({
+        headBefore: before,
+        headAfter: UNBORN_HEAD,
+        newestReflog: reflog(before.sha, "commit: init"),
+      }),
     ).toBeUndefined();
   });
 
@@ -359,6 +391,9 @@ describe("hasHeadTransition", () => {
 
     expect(hasHeadTransition({ headBefore: before, headAfter: after })).toBe(true);
     expect(hasHeadTransition({ headBefore: before, headAfter: before })).toBe(false);
+    // HEAD destruction is not a commit, and must not pay for a reflog probe
+    expect(hasHeadTransition({ headBefore: before, headAfter: UNBORN_HEAD })).toBe(false);
+    expect(hasHeadTransition({ headBefore: UNBORN_HEAD, headAfter: after })).toBe(true);
     expect(hasHeadTransition({ headBefore: undefined, headAfter: after })).toBe(false);
     expect(hasHeadTransition({ headBefore: before, headAfter: undefined })).toBe(false);
   });
@@ -396,6 +431,70 @@ describe("probeHead", () => {
     const cwd = createTempCrewDirs().cwd;
 
     expect(probeHead(cwd)).toEqual({ kind: "not-a-repository" });
+  });
+
+  it("fails closed when a born repository's log read is transiently unreadable", () => {
+    const cwd = createTempCrewDirs().cwd;
+    initRepo(cwd);
+
+    // `git log` fails for a non-timeout reason, but HEAD still resolves to a commit:
+    // the repository is born and the failure is transient, so it must not become
+    // UNBORN_HEAD (that would invent an event from the unchanged HEAD later).
+    failNextProbe("head");
+    let probe: HeadProbe | undefined;
+    const probes = recordProbes(() => {
+      probe = probeHead(cwd);
+    });
+
+    expect(probes).toEqual(["head", "rev-parse-verify"]);
+    expect(probe).toEqual({ kind: "unreadable" });
+  });
+
+  it("fails closed when the HEAD-verification probe itself fails", () => {
+    const cwd = createTempCrewDirs().cwd;
+    initRepo(cwd);
+
+    // Both the log read and the evidence probe fail transiently: nothing is proved, so
+    // neither "unborn" nor "not a repository" may be remembered.
+    setGitProbeFailureInjector(kind => kind === "head" || kind === "rev-parse-verify");
+    let probe: HeadProbe | undefined;
+    const probes = recordProbes(() => {
+      probe = probeHead(cwd);
+    });
+
+    expect(probes).toEqual(["head", "rev-parse-verify"]);
+    expect(probe).toEqual({ kind: "unreadable" });
+  });
+
+  it("keeps a genuine unborn repository when the log read is transiently unreadable", () => {
+    const cwd = createTempCrewDirs().cwd;
+    git("init -q -b main --template=", cwd);
+
+    failNextProbe("head");
+    let probe: HeadProbe | undefined;
+    const probes = recordProbes(() => {
+      probe = probeHead(cwd);
+    });
+
+    // rev-parse --verify also fails (there is no commit), and the work-tree probe
+    // confirms the repository: the fallback chain still classifies it as unborn.
+    expect(probes).toEqual(["head", "rev-parse-verify", "work-tree"]);
+    expect(probe).toEqual({ kind: "head", state: UNBORN_HEAD });
+  });
+
+  it("does not fabricate a not-a-repository marker when the work-tree probe fails", () => {
+    const cwd = createTempCrewDirs().cwd;
+    git("init -q -b main --template=", cwd);
+
+    // The classification chain cannot finish: this is unreadable, not the sentinel.
+    failProbe("work-tree");
+    let probe: HeadProbe | undefined;
+    const probes = recordProbes(() => {
+      probe = probeHead(cwd);
+    });
+
+    expect(probes).toEqual(["head", "rev-parse-verify", "work-tree"]);
+    expect(probe).toEqual({ kind: "unreadable" });
   });
 });
 
@@ -806,6 +905,101 @@ describe("commit feed event from a real repository", () => {
 
     expect(commitEvents(cwd)).toHaveLength(0);
   });
+
+  it("writes no commit event when a born repository's log read fails at tool_call", () => {
+    const cwd = createTempCrewDirs().cwd;
+    initRepo(cwd);
+    const tracker = new CommitHeadTracker();
+
+    // A one-shot non-timeout failure of `git log` in a repository that is provably born.
+    failNextProbe("head");
+    const beforeProbes = recordProbes(() => rememberHeadBeforeCall(tracker, "call-1", cwd));
+    setGitProbeFailureInjector(undefined);
+
+    // The SHA still resolves, so the log failure is transient: nothing is remembered.
+    expect(beforeProbes).toEqual(["head", "rev-parse-verify"]);
+    expect(tracker.size).toBe(0);
+
+    // The next successful read sees the same HEAD. Had UNBORN_HEAD been remembered, this
+    // would pass the transition check and re-announce the init commit from the reflog.
+    let decision: { preview: string } | undefined;
+    const afterProbes = recordProbes(() => {
+      decision = decideCommitEventForCall(tracker, "call-1", cwd);
+    });
+
+    expect(afterProbes).toEqual(["head"]);
+    expect(decision).toBeUndefined();
+    logIfDecided(cwd, decision);
+    expect(commitEvents(cwd)).toHaveLength(0);
+  });
+
+  it("still reports the first commit when an unborn repository's log read fails at tool_call", () => {
+    const cwd = createTempCrewDirs().cwd;
+    git("init -q -b main --template=", cwd);
+    fs.writeFileSync(path.join(cwd, "README.md"), "# repo\n");
+    git("add .", cwd);
+    const tracker = new CommitHeadTracker();
+
+    failNextProbe("head");
+    const beforeProbes = recordProbes(() => rememberHeadBeforeCall(tracker, "call-1", cwd));
+    setGitProbeFailureInjector(undefined);
+
+    // rev-parse --verify genuinely fails here, and the work-tree probe confirms the
+    // repository, so the transient log failure still classifies as UNBORN_HEAD.
+    expect(beforeProbes).toEqual(["head", "rev-parse-verify", "work-tree"]);
+    expect(tracker.size).toBe(1);
+
+    git('commit -qm "init: first commit"', cwd);
+    const decision = decideCommitEventForCall(tracker, "call-1", cwd);
+
+    expect(decision).toBeDefined();
+    expect(decision!.preview).toBe(`${git("rev-parse --short HEAD", cwd)} init: first commit`);
+  });
+
+  it("writes no commit event when the work-tree probe fails during classification", () => {
+    const cwd = createTempCrewDirs().cwd;
+    git("init -q -b main --template=", cwd);
+    fs.writeFileSync(path.join(cwd, "README.md"), "# repo\n");
+    git("add .", cwd);
+    const tracker = new CommitHeadTracker();
+
+    // A failed work-tree probe answers nothing: it must not become the sentinel. If it
+    // did, the first commit below would pass sentinel -> real SHA and be announced.
+    failProbe("work-tree");
+    const beforeProbes = recordProbes(() => rememberHeadBeforeCall(tracker, "call-1", cwd));
+    setGitProbeFailureInjector(undefined);
+
+    expect(beforeProbes).toEqual(["head", "rev-parse-verify", "work-tree"]);
+    expect(tracker.size).toBe(0);
+
+    git('commit -qm "init: first commit"', cwd);
+    logIfDecided(cwd, decideCommitEventForCall(tracker, "call-1", cwd));
+
+    expect(commitEvents(cwd)).toHaveLength(0);
+  });
+
+  it("writes no commit event and pays no reflog probe when a real HEAD becomes unborn", () => {
+    const cwd = createTempCrewDirs().cwd;
+    initRepo(cwd);
+    const tracker = new CommitHeadTracker();
+    rememberHeadBeforeCall(tracker, "call-1", cwd);
+
+    // An orphan checkout destroys HEAD without committing. The after-side read is
+    // UNBORN_HEAD, which is a rejection, not a commit: no reflog probe is needed.
+    git("checkout -q --orphan orphan", cwd);
+
+    let decision: { preview: string } | undefined;
+    const probes = recordProbes(() => {
+      decision = decideCommitEventForCall(tracker, "call-1", cwd);
+    });
+
+    expect(probes).toEqual(["head", "rev-parse-verify", "work-tree"]);
+    expect(probes).not.toContain("reflog");
+    expect(decision).toBeUndefined();
+
+    logIfDecided(cwd, decision);
+    expect(commitEvents(cwd)).toHaveLength(0);
+  });
 });
 
 describe("git probe bounds", () => {
@@ -819,25 +1013,42 @@ describe("git probe bounds", () => {
     expect(probes).toEqual(["head"]);
   });
 
-  it("pays the work-tree fallback at tool_call outside a repository", () => {
+  it("pays the verified fallback chain at tool_call outside a repository", () => {
     const cwd = createTempCrewDirs().cwd;
     const tracker = new CommitHeadTracker();
 
     const probes = recordProbes(() => rememberHeadBeforeCall(tracker, "call-1", cwd));
 
-    expect(probes).toEqual(["head", "work-tree"]);
+    // log fails, `rev-parse --verify` answers "no ref", then the work-tree probe confirms
+    // that there is no work tree. Three bounded calls before the sentinel is remembered.
+    expect(probes).toEqual(["head", "rev-parse-verify", "work-tree"]);
     expect(tracker.take("call-1")).toBe(NOT_A_REPOSITORY);
   });
 
-  it("pays the work-tree fallback at tool_call in an unborn repository", () => {
+  it("pays the verified fallback chain at tool_call in an unborn repository", () => {
     const cwd = createTempCrewDirs().cwd;
     git("init -q -b main --template=", cwd);
     const tracker = new CommitHeadTracker();
 
     const probes = recordProbes(() => rememberHeadBeforeCall(tracker, "call-1", cwd));
 
-    expect(probes).toEqual(["head", "work-tree"]);
+    expect(probes).toEqual(["head", "rev-parse-verify", "work-tree"]);
     expect(tracker.take("call-1")).toEqual(UNBORN_HEAD);
+  });
+
+  it("pays head + rev-parse-verify at tool_call when a born log read is transient", () => {
+    const cwd = createTempCrewDirs().cwd;
+    initRepo(cwd);
+    const tracker = new CommitHeadTracker();
+
+    failNextProbe("head");
+    const probes = recordProbes(() => rememberHeadBeforeCall(tracker, "call-1", cwd));
+    setGitProbeFailureInjector(undefined);
+
+    // The SHA is evidence enough that the log failure was transient: no work-tree probe
+    // is paid, and nothing is remembered (the chain stops at two calls, not three).
+    expect(probes).toEqual(["head", "rev-parse-verify"]);
+    expect(tracker.size).toBe(0);
   });
 
   it("pays two probes at tool_result for a landed commit", () => {
@@ -872,7 +1083,7 @@ describe("git probe bounds", () => {
     expect(decision).toBeUndefined();
   });
 
-  it("pays at most the work-tree fallback at tool_result when the HEAD read fails", () => {
+  it("pays the full verified fallback at tool_result when the HEAD read fails", () => {
     const cwd = createTempCrewDirs().cwd;
     const tracker = new CommitHeadTracker();
     rememberHeadBeforeCall(tracker, "call-1", cwd);
@@ -882,8 +1093,28 @@ describe("git probe bounds", () => {
       decision = decideCommitEventForCall(tracker, "call-1", cwd);
     });
 
-    // HEAD + the fallback that tells "unborn" from "not a repository"; no reflog probe
-    expect(probes).toEqual(["head", "work-tree"]);
+    // HEAD + the fallback chain that tells "unborn" from "not a repository"; no reflog.
+    expect(probes).toEqual(["head", "rev-parse-verify", "work-tree"]);
+    expect(decision).toBeUndefined();
+  });
+
+  it("pays no reflog probe at tool_result when a real HEAD becomes unborn", () => {
+    const cwd = createTempCrewDirs().cwd;
+    initRepo(cwd);
+    const tracker = new CommitHeadTracker();
+    rememberHeadBeforeCall(tracker, "call-1", cwd);
+
+    git("checkout -q --orphan orphan", cwd);
+
+    let decision: { preview: string } | undefined;
+    const probes = recordProbes(() => {
+      decision = decideCommitEventForCall(tracker, "call-1", cwd);
+    });
+
+    // The after side reads UNBORN_HEAD (three probes); the transition check rejects
+    // real -> unborn before the reflog is even considered.
+    expect(probes).toEqual(["head", "rev-parse-verify", "work-tree"]);
+    expect(probes).not.toContain("reflog");
     expect(decision).toBeUndefined();
   });
 

@@ -167,6 +167,8 @@ export interface AgentTask {
   taskId?: string;
   modelOverride?: string;
   maxOutput?: MaxOutputConfig;
+  /** Runtime worker identity; becomes PI_AGENT_NAME and the task's assigned_to. */
+  workerName?: string;
 }
 
 export interface AgentResult {
@@ -177,6 +179,8 @@ export interface AgentResult {
   progress: AgentProgress;
   config?: CrewAgentConfig;
   taskId?: string;
+  /** Runtime worker identity (PI_AGENT_NAME) used to fence stale receipts. */
+  workerName?: string;
   wasGracefullyShutdown?: boolean;
   error?: string;
   artifactPaths?: {

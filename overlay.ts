@@ -740,6 +740,7 @@ export class MessengerOverlay implements Component, Focusable {
   private static readonly SIGNIFICANT_EVENTS = new Set<FeedEventType>([
     "task.done", "task.block", "task.start", "message",
     "plan.done", "plan.failed", "task.revise", "task.revise-tree",
+    "crew.idle",
   ]);
 
   private detectAndFlashEvents(events: FeedEvent[], prevTs: string | null): void {
@@ -760,6 +761,7 @@ export class MessengerOverlay implements Component, Focusable {
         last.type === "task.start" ? `${sameType.length} tasks started` :
         last.type === "task.block" ? `${sameType.length} tasks blocked` :
         last.type === "message" ? `${sameType.length} new messages` :
+        last.type === "crew.idle" ? `${sameType.length} crew idle events` :
         `${sameType.length} ${last.type} events`;
       message = label;
     } else {
@@ -772,6 +774,7 @@ export class MessengerOverlay implements Component, Focusable {
         last.type === "message" ? `${last.agent}${preview || " sent a message"}` :
         last.type === "plan.done" ? "Planning completed" :
         last.type === "plan.failed" ? "Planning failed" :
+        last.type === "crew.idle" ? "crew idle — outstanding work" :
         `${last.agent} ${last.type}${target}`;
     }
 

@@ -73,10 +73,13 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
   }
   const prompt = promptOverride ?? buildLobbyPrompt(cwd, config);
 
-  // `-ne` (--no-extensions) disables extension DISCOVERY for the worker session;
-  // only the explicit `--extension` paths below load. Without it, every extension
-  // installed for the orchestrator (intercom, scrumble, …) also loads inside the
-  // crew worker and can deliver messages mid-prompt (the intercom/watcher crash).
+  // `-ne` (--no-extensions) disables extension discovery AND the built-in
+  // extensions for the worker session; only explicit `--extension` paths load.
+  // Those paths come from the crew-worker agent's `tools` frontmatter
+  // (path-valued entries, passed below) plus EXTENSION_DIR (pi-messenger).
+  // Without it, every extension installed for the orchestrator (intercom,
+  // scrumble, …) also loads inside the crew worker and can deliver messages
+  // mid-prompt (the intercom/watcher crash).
   const args = ["--mode", "json", "--no-session", "-ne", "-p"];
   const model = resolveModel(undefined, undefined, undefined, config.models?.worker, sessionModel, workerConfig.model);
   if (model) pushModelArgs(args, model);

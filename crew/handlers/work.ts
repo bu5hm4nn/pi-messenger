@@ -7,6 +7,7 @@
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Dirs } from "../../lib.ts";
+import { generateMemorableName } from "../../lib.ts";
 import type { CrewParams, AppendEntryFn } from "../types.ts";
 import { result } from "../utils/result.ts";
 import { resolveModel, spawnAgents } from "../agents.ts";
@@ -184,10 +185,17 @@ export async function execute(
     );
     const others = readyTasks.filter(t => t.id !== task.id);
     const prompt = buildWorkerPrompt(task, prdLabel, cwd, config, others, skills, teamStore.buildTeamPromptContext(cwd, task));
-    store.appendTaskProgress(cwd, task.id, "system", `Assigned to crew-worker`);
+    // Pre-generate the worker identity so the task can record the same value
+    // at dispatch. The worker session receives it as PI_AGENT_NAME and
+    // task.start writes it to assigned_to, which is what the result loop
+    // compares against when fencing stale receipts.
+    const workerName = generateMemorableName();
+    store.updateTask(cwd, task.id, { assigned_to: workerName });
+    store.appendTaskProgress(cwd, task.id, "system", `Assigned to crew-worker ${workerName}`);
 
     return {
       agent: "crew-worker",
+      workerName,
       task: prompt,
       taskId: task.id,
       modelOverride: taskModel,
@@ -210,14 +218,19 @@ export async function execute(
   const blocked: string[] = [];
 
   // A worker that exited without clean task.done bookkeeping: its work may
-  // have landed on disk. Mark indeterminate instead of failed.
-  const markIndeterminate = (taskId: string, taskStatus: string | undefined, why: string) => {
+  // have landed on disk. Shared wording used by every indeterminate path.
+  const appendIndeterminateNote = (taskId: string, taskStatus: string | undefined, why: string) => {
     const task = store.getTask(cwd, taskId);
     // Embed the pre-exit base commit: task.start overwrites base_commit on the
     // re-attempt, so the reconcile instruction would otherwise lose its anchor.
     const baseRef = task?.base_commit ? ` Prior attempt base commit: ${task.base_commit}.` : "";
     store.appendTaskProgress(cwd, taskId, "system",
       `Worker exited before task.done (status was ${taskStatus ?? "unknown"}) — indeterminate: work may have landed. Re-attempt must FIRST reconcile: run git log/diff against the task base commit and review/reuse any landed work before re-implementing.${baseRef} ${why}`);
+  };
+
+  // Classify an indeterminate receipt (adds it to the wave result).
+  const markIndeterminate = (taskId: string, taskStatus: string | undefined, why: string) => {
+    appendIndeterminateNote(taskId, taskStatus, why);
     indeterminate.push(taskId);
   };
 
@@ -279,6 +292,21 @@ export async function execute(
     }
     const task = store.getTask(cwd, taskId);
 
+    // Ownership fence: a receipt can arrive after a later wave has re-claimed
+    // and started the task. Mutating on status alone would reset or block the
+    // new owner's in_progress task and orphan its work. The receipt carries
+    // the per-dispatch workerName (recorded as assigned_to at dispatch and by
+    // task.start); a mismatch leaves the task entirely untouched. Done/blocked
+    // tasks have already had assigned_to cleared by their worker, so they are
+    // not mutable here and are classified as before. This fences waves, not
+    // two workers that happen to share a generated name.
+    const receiptOwner = r.workerName ?? r.agent;
+    if (task && (task.status === "todo" || task.status === "in_progress") && task.assigned_to !== receiptOwner) {
+      store.appendTaskProgress(cwd, taskId, "system",
+        `Ignored stale result from ${receiptOwner}: task is currently assigned to ${task.assigned_to ?? "no worker"} (status ${task.status}).`);
+      continue;
+    }
+
     if (r.exitCode === 0) {
       if (task?.status === "done") {
         succeeded.push(taskId);
@@ -327,6 +355,8 @@ export async function execute(
         }
       } else if (autonomous && task?.status === "in_progress") {
         store.appendTaskProgress(cwd, taskId, "system", `Worker crashed: ${r.error ?? "Unknown error"}`);
+        // The task is blocked, but the worker may still have landed work.
+        appendIndeterminateNote(taskId, task.status, `Worker crashed: ${r.error ?? "Unknown error"}`);
         store.blockTask(cwd, taskId, `Worker failed: ${r.error ?? "Unknown error"}`);
         blocked.push(taskId);
       } else {
@@ -339,6 +369,10 @@ export async function execute(
             blocked.push(taskId);
             continue;
           }
+          // The reset lets a retry proceed, but the crash may still have
+          // landed work — record the same reconciliation note as the other
+          // non-graceful exit paths before reporting the failure.
+          appendIndeterminateNote(taskId, task.status, `Worker failed: ${r.error ?? "Unknown error"}`);
         } else if (task?.status === "todo") {
           // Worker crashed before claiming the task. Consume an attempt here
           // too — otherwise a crash-looping worker is bounded only by maxWaves,

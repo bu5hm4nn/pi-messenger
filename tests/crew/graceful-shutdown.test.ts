@@ -437,9 +437,9 @@ describe("crew/graceful shutdown", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const t1 = store.createTask(dirs.cwd, "Abandoned task", "Worker forgot task.done");
 
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string }>) => {
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
-        if (t.taskId) store.startTask(dirs.cwd, t.taskId, "Worker");
+        if (t.taskId) store.startTask(dirs.cwd, t.taskId, t.workerName!);
       }
       return tasks.map(t => ({
         agent: "crew-worker",
@@ -455,6 +455,7 @@ describe("crew/graceful shutdown", () => {
           durationMs: 0,
         },
         taskId: t.taskId,
+        workerName: t.workerName,
       }));
     });
 
@@ -480,9 +481,9 @@ describe("crew/graceful shutdown", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const t1 = store.createTask(dirs.cwd, "Interrupted task", "Graceful non-zero");
 
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string }>) => {
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
-        if (t.taskId) store.startTask(dirs.cwd, t.taskId, "Worker");
+        if (t.taskId) store.startTask(dirs.cwd, t.taskId, t.workerName!);
       }
       return tasks.map(t => ({
         agent: "crew-worker",
@@ -498,6 +499,7 @@ describe("crew/graceful shutdown", () => {
           durationMs: 0,
         },
         taskId: t.taskId,
+        workerName: t.workerName,
         wasGracefullyShutdown: true,
         error: "terminated",
       }));

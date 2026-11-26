@@ -188,7 +188,9 @@ async function runAgent(
   const agentConfig = agents.find(a => a.name === task.agent);
   const progress = createProgress(task.agent);
   const startTime = Date.now();
-  const workerName = generateMemorableName();
+  // work.execute pre-generates this so it can record the same identity on the
+  // task at dispatch; other spawn callers let runAgent generate it.
+  const workerName = task.workerName ?? generateMemorableName();
 
   const role = agentConfig?.crewRole ?? "worker";
   const maxOutput = task.maxOutput
@@ -208,10 +210,13 @@ async function runAgent(
   }
 
   return new Promise((resolve) => {
-    // Build args for pi command
-    // `-ne` (--no-extensions) disables extension DISCOVERY for the worker session;
-    // only the explicit `--extension` paths below load, so orchestrator-only
-    // extensions (intercom, scrumble) never enter a crew worker.
+    // Build args for pi command.
+    // `-ne` (--no-extensions) disables extension discovery AND the built-in
+    // extensions for the worker session; only explicit `--extension` paths
+    // load. Those paths come from the spawned agent's `tools` frontmatter
+    // (path-valued entries, passed below) plus EXTENSION_DIR (pi-messenger), so
+    // orchestrator-only extensions (intercom, scrumble, …) never enter a crew
+    // worker.
     const args = ["--mode", "json", "--no-session", "-ne", "-p"];
     const model = task.modelOverride ?? config.models?.[role] ?? agentConfig?.model;
     if (model) pushModelArgs(args, model);
@@ -362,6 +367,7 @@ async function runAgent(
         progress,
         config: agentConfig,
         taskId: task.taskId,
+        workerName,
         wasGracefullyShutdown: gracefulShutdownRequested,
         error: progress.error,
         artifactPaths: artifactPaths ? {

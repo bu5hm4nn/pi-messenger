@@ -90,6 +90,27 @@ describe("crew agent event handling", () => {
     expect(jsonl).toContain("text_delta");
   });
 
+  it("carries the dispatch workerName into PI_AGENT_NAME and the result", async () => {
+    const proc = createProcess();
+    spawnMock.mockReturnValue(proc);
+    const { spawnAgents } = await import("../../crew/agents.ts");
+
+    const resultPromise = spawnAgents([{
+      agent: "crew-worker",
+      task: "Implement task",
+      taskId: "task-1",
+      workerName: "WaveAWorker",
+    }], dirs.cwd);
+
+    proc.exitCode = 0;
+    proc.emit("close", 0);
+
+    const [result] = await resultPromise;
+
+    expect(spawnMock.mock.calls[0][2].env.PI_AGENT_NAME).toBe("WaveAWorker");
+    expect(result.workerName).toBe("WaveAWorker");
+  });
+
   it("fails fast on terminal provider quota errors", async () => {
     const proc = createProcess();
     spawnMock.mockReturnValue(proc);

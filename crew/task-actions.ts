@@ -123,8 +123,11 @@ export function executeTaskAction(
       if (options?.isWorkerActive?.(taskId)) {
         return { success: false, error: "active_worker", message: `Cannot reset ${taskId} while its worker is active` };
       }
+      // Explicit reset: renew the retry budget only after the reset mutation
+      // actually succeeds (a refusal above or a fenced reset below never does).
       const resetTasks = store.resetTask(cwd, taskId, false, {
         ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+        renewBudget: true,
       });
       if (resetTasks.length === 0) return { success: false, error: "reset_failed", message: `Failed to reset ${taskId}` };
       logFeedEvent(cwd, agentName, "task.reset", taskId, task.title);
@@ -138,9 +141,11 @@ export function executeTaskAction(
         return { success: false, error: "active_worker", message: `Cannot reset ${activeTask.id} while its worker is active` };
       }
       // The worker's token fences the root takeover; dependent resets remain
-      // part of the same explicit cascade once the root is accepted.
+      // part of the same explicit cascade once the root is accepted. Every
+      // dependent actually reset renews its own budget independently.
       const resetTasks = store.resetTask(cwd, taskId, true, {
         ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+        renewBudget: true,
       });
       if (resetTasks.length === 0) return { success: false, error: "reset_failed", message: `Failed to reset ${taskId}` };
       logFeedEvent(cwd, agentName, "task.reset", taskId, `cascade (${resetTasks.length} tasks)`);
@@ -168,6 +173,8 @@ export function executeTaskAction(
       }
       // Stop is an explicit takeover: reset through the lifecycle mutation so
       // the active dispatch token and completion attribution are invalidated.
+      // It is NOT a reset for budget purposes: stopping a worker never renews
+      // the retry budget, so no renewBudget option is passed here.
       store.resetTask(cwd, taskId);
       logFeedEvent(cwd, agentName, "task.reset", taskId, "stopped");
       return { success: true, message: `Stopped ${taskId}` };

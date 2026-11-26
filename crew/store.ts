@@ -574,6 +574,8 @@ function normalizeApproval(raw: unknown): TaskApproval | undefined {
 
 function normalizeTask(raw: Task): Task {
   const approval = normalizeApproval(raw.approval);
+  const attemptCount = typeof raw.attempt_count === "number" ? raw.attempt_count : 0;
+  const rawBaseline = typeof raw.budget_baseline === "number" ? raw.budget_baseline : undefined;
   return {
     ...raw,
     depends_on: Array.isArray(raw.depends_on) ? raw.depends_on : [],
@@ -581,8 +583,14 @@ function normalizeTask(raw: Task): Task {
     role: typeof raw.role === "string" && raw.role.trim().length > 0 ? raw.role : undefined,
     risk_labels: normalizeRiskLabels(Array.isArray(raw.risk_labels) ? raw.risk_labels.filter(s => typeof s === "string") : undefined),
     approval,
-    attempt_count: typeof raw.attempt_count === "number" ? raw.attempt_count : 0,
-    budget_baseline: typeof raw.budget_baseline === "number" ? raw.budget_baseline : undefined,
+    attempt_count: attemptCount,
+    // An out-of-range baseline is hand-corruption, not a legitimate budget:
+    // above the lifetime count it would make attemptsSinceReset negative and
+    // fail open every cap comparison. Repair it here (fresh-budget-equivalent,
+    // since-reset 0) so the next guarded mutation persists the bounded record.
+    budget_baseline: rawBaseline === undefined
+      ? undefined
+      : Math.max(0, Math.min(rawBaseline, attemptCount)),
     dispatch_token: typeof raw.dispatch_token === "string" ? raw.dispatch_token : undefined,
     completed_dispatch: typeof raw.completed_dispatch === "string" ? raw.completed_dispatch : undefined,
     rev: typeof raw.rev === "number" ? raw.rev : 0,
@@ -857,10 +865,13 @@ export interface ClaimOptions {
  * Retry budget consumed since the last explicit reset. `attempt_count` is the
  * lifetime number (audit/completion import); `budget_baseline` is the lifetime
  * value observed at that reset. Legacy records have no baseline and therefore
- * keep their original lifetime accounting (baseline 0).
+ * keep their original lifetime accounting (baseline 0). The result is clamped
+ * at zero: a corrupted baseline above the lifetime count is repaired on
+ * hydration, and this read guard also bounds any raw/transient snapshot so
+ * corruption can never buy a negative (fail-open) budget.
  */
 export function attemptsSinceReset(task: Task): number {
-  return (task.attempt_count ?? 0) - (task.budget_baseline ?? 0);
+  return Math.max(0, (task.attempt_count ?? 0) - (task.budget_baseline ?? 0));
 }
 
 /**
@@ -1102,11 +1113,61 @@ export interface ResetTaskOptions extends LifecycleFence {
    */
   renewBudget?: boolean;
   /**
-   * Revalidate the lifecycle state captured before a planning pass. Spec edits
-   * may have bumped generation/rev since then, but a claim or completion must
-   * refuse the reset instead of being treated as a takeover.
+   * Revalidate the lifecycle state captured by the caller before this reset.
+   * Spec edits may have bumped generation/rev since then, but a claim or
+   * completion after the snapshot must refuse the reset instead of being
+   * treated as a takeover.
    */
   expectedLifecycle?: ResetLifecycleSnapshot;
+  /**
+   * Refuse while a live dispatch reservation exists. Cascade dependents set
+   * this so a task claimed or started after the subtree scan is skipped rather
+   * than clobbered. The explicit root reset keeps clearing its reservation.
+   */
+  requireNoDispatchToken?: boolean;
+  /**
+   * Dependent snapshot captured by the caller before the cascade began. When
+   * present, these tasks are revalidated under their guards instead of being
+   * re-scanned, so a claim between the snapshot and the reset is detected.
+   */
+  cascadeSnapshot?: Task[];
+}
+
+/** Tasks that transitively depend on rootId, in the caller's snapshot order. */
+function transitiveDependentSnapshots(allTasks: Task[], rootId: string): Task[] {
+  const collected = new Set<string>();
+  const queue = [rootId];
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    for (const task of allTasks) {
+      if (task.id === rootId || collected.has(task.id)) continue;
+      if (task.depends_on.includes(current)) {
+        collected.add(task.id);
+        queue.push(task.id);
+      }
+    }
+  }
+  return allTasks.filter(t => collected.has(t.id));
+}
+
+/** Why a cascade dependent was not safe to reset after the snapshot. */
+function cascadeSkipReason(snapshot: Task, current: Task | null): string {
+  if (!current) return "task disappeared before its reset";
+  const reasons: string[] = [];
+  if (current.status !== snapshot.status) {
+    reasons.push(`status changed from ${snapshot.status} to ${current.status}`);
+  }
+  if ((current.assigned_to ?? undefined) !== (snapshot.assigned_to ?? undefined)) {
+    reasons.push(`ownership changed from ${snapshot.assigned_to ?? "unassigned"} to ${current.assigned_to ?? "unassigned"}`);
+  }
+  if (current.dispatch_token !== undefined) reasons.push("an active dispatch reservation is held");
+  if ((current.completed_at ?? undefined) !== (snapshot.completed_at ?? undefined)) {
+    reasons.push("completion changed");
+  }
+  if ((current.completed_dispatch ?? undefined) !== (snapshot.completed_dispatch ?? undefined)) {
+    reasons.push("completion attribution changed");
+  }
+  return reasons.length > 0 ? reasons.join(", ") : "lifecycle changed";
 }
 
 export function resetTask(
@@ -1133,6 +1194,7 @@ export function resetTask(
     }
     if (options?.dispatchToken !== undefined && task.dispatch_token !== options.dispatchToken) return null;
     if (options?.owner !== undefined && task.assigned_to !== options.owner) return null;
+    if (options?.requireNoDispatchToken && task.dispatch_token !== undefined) return null;
     wasDone = task.status === "done";
     return {
       status: "todo",
@@ -1148,14 +1210,34 @@ export function resetTask(
 
   cleanupBlockFiles(cwd, taskId);
 
-  // If cascade, reset all tasks that depend on this one
+  // If cascade, reset every transitive dependent. Selection uses the caller's
+  // pre-cascade snapshot when supplied; otherwise scan now. Each dependent is
+  // revalidated under its own guard before the write: a task claimed, started,
+  // completed or reassigned after the snapshot is skipped with a note instead
+  // of being clobbered or granted a renewed budget.
   if (cascade) {
-    const allTasks = getTasks(cwd);
-    for (const t of allTasks) {
-      if (t.depends_on.includes(taskId) && t.status !== "todo") {
-        const cascaded = resetTask(cwd, t.id, true, { renewBudget: options?.renewBudget });
-        resetTasks.push(...cascaded);
+    const allTasks = options?.cascadeSnapshot ?? getTasks(cwd);
+    for (const snapshot of transitiveDependentSnapshots(allTasks, taskId)) {
+      if (snapshot.status === "todo") continue;
+      const cascaded = resetTask(cwd, snapshot.id, false, {
+        renewBudget: options?.renewBudget,
+        expectedLifecycle: {
+          status: snapshot.status,
+          createdAt: snapshot.created_at,
+          assignedTo: snapshot.assigned_to,
+          dispatchToken: snapshot.dispatch_token,
+          completedAt: snapshot.completed_at,
+          completedDispatch: snapshot.completed_dispatch,
+        },
+        requireNoDispatchToken: true,
+      });
+      if (cascaded.length === 0) {
+        const current = getTask(cwd, snapshot.id);
+        appendTaskProgress(cwd, snapshot.id, "system",
+          `Cascade reset skipped ${snapshot.id}: ${cascadeSkipReason(snapshot, current)}; left untouched.`);
+        continue;
       }
+      resetTasks.push(...cascaded);
     }
   }
 

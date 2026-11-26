@@ -141,11 +141,15 @@ export function executeTaskAction(
         return { success: false, error: "active_worker", message: `Cannot reset ${activeTask.id} while its worker is active` };
       }
       // The worker's token fences the root takeover; dependent resets remain
-      // part of the same explicit cascade once the root is accepted. Every
-      // dependent actually reset renews its own budget independently.
+      // part of the same explicit cascade once the root is accepted. The
+      // subtree snapshot is passed through so each dependent is revalidated
+      // under its guard: one claimed after this scan is skipped, not clobbered
+      // or granted a renewed budget. Every dependent actually reset renews its
+      // own budget independently.
       const resetTasks = store.resetTask(cwd, taskId, true, {
         ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
         renewBudget: true,
+        cascadeSnapshot: subtree,
       });
       if (resetTasks.length === 0) return { success: false, error: "reset_failed", message: `Failed to reset ${taskId}` };
       logFeedEvent(cwd, agentName, "task.reset", taskId, `cascade (${resetTasks.length} tasks)`);

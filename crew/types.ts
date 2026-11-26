@@ -71,9 +71,10 @@ export interface Task {
   attempt_count: number;         // Lifetime attempts (audit/completion import; never reset)
   /**
    * Lifetime attempt_count observed when an explicit task reset last renewed
-   * the retry budget. Attempts since that reset = attempt_count - baseline.
-   * Absent on legacy records, which keeps their original lifetime accounting.
-   * Only explicit reset/cascade-reset write it; automatic recoveries never do.
+   * the retry budget. Attempts since that reset = attempt_count - baseline
+   * (clamped at 0). Absent on legacy records, which keeps their original
+   * lifetime accounting. Only explicit reset/cascade-reset write it; automatic
+   * recoveries never do. Hydration repairs a baseline above attempt_count.
    */
   budget_baseline?: number;
   review_count?: number;         // How many times reviewed

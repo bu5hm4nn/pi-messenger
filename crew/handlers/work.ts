@@ -87,8 +87,10 @@ export async function execute(
         minAttemptCount: config.work.maxAttemptsPerTask,
       });
       if (blocked) {
+        // The decision used attempts since the last explicit reset; report the
+        // same unit from the guarded blocked record, not the lifetime count.
         store.appendTaskProgress(cwd, task.id, "system",
-          `Auto-blocked after ${task.attempt_count} attempts (max: ${config.work.maxAttemptsPerTask})`);
+          `Auto-blocked after ${store.attemptsSinceReset(blocked)} attempts (max: ${config.work.maxAttemptsPerTask})`);
         logFeedEvent(cwd, "crew", "task.block", task.id, `Max attempts (${config.work.maxAttemptsPerTask}) reached`);
       }
     } else {

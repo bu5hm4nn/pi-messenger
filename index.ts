@@ -55,6 +55,7 @@ import { MessengerConfigOverlay } from "./config-overlay.ts";
 import { loadConfig, loadGlobalConfig, matchesAutoRegisterPath, type MessengerConfig } from "./config.ts";
 import { executeCrewAction } from "./crew/index.ts";
 import { logFeedEvent, pruneFeed } from "./feed.ts";
+import { decideCommitEvent, isGitCommitCommand, readHeadState, type HeadState } from "./git-commit.ts";
 import type { CrewParams } from "./crew/types.ts";
 import {
   autonomousState,
@@ -699,17 +700,22 @@ Usage (action-based API - preferred):
     }, REGISTRY_FLUSH_MS);
   }
 
-  function isGitCommit(command: string): boolean {
-    return /\bgit\s+commit\b/.test(command);
+  // HEAD captured before a git-commit-looking bash call, so the tool result can tell
+  // whether the command actually moved HEAD. Bounded: drop oldest ids past the cap.
+  const MAX_TRACKED_COMMIT_HEADS = 64;
+  const commitHeadsBeforeCall = new Map<string, HeadState>();
+
+  function rememberCommitHead(toolCallId: string, headBefore: HeadState): void {
+    commitHeadsBeforeCall.set(toolCallId, headBefore);
+    while (commitHeadsBeforeCall.size > MAX_TRACKED_COMMIT_HEADS) {
+      const oldest = commitHeadsBeforeCall.keys().next();
+      if (oldest.done) break;
+      commitHeadsBeforeCall.delete(oldest.value);
+    }
   }
 
   function isTestRun(command: string): boolean {
     return /\b(npm\s+test|npx\s+(jest|vitest|mocha)|pytest|go\s+test|cargo\s+test|bun\s+test)\b/.test(command);
-  }
-
-  function extractCommitMessage(command: string): string {
-    const match = command.match(/-m\s+["']([^"']+)["']/);
-    return match ? match[1] : "";
   }
 
   function updateAutoStatus(): void {
@@ -774,8 +780,10 @@ Usage (action-based API - preferred):
     } else if (toolName === "bash") {
       const command = input.command as string;
       if (command) {
-        if (isGitCommit(command)) {
+        if (isGitCommitCommand(command)) {
           setCurrentActivity("committing");
+          const headBefore = readHeadState(ctx.cwd);
+          if (headBefore) rememberCommitHead(event.toolCallId, headBefore);
         } else if (isTestRun(command)) {
           setCurrentActivity("running tests");
         }
@@ -803,11 +811,15 @@ Usage (action-based API - preferred):
       const command = input.command as string;
       if (command) {
         const cwd = ctx.cwd;
-        if (isGitCommit(command)) {
-          const msg = extractCommitMessage(command);
-          logFeedEvent(cwd, state.agentName, "commit", undefined, msg);
-          setLastToolCall(`commit: ${msg}`);
-          trackRecentCommit();
+        if (isGitCommitCommand(command)) {
+          const headBefore = commitHeadsBeforeCall.get(event.toolCallId);
+          commitHeadsBeforeCall.delete(event.toolCallId);
+          const decision = decideCommitEvent({ headBefore, headAfter: readHeadState(cwd) });
+          if (decision) {
+            logFeedEvent(cwd, state.agentName, "commit", undefined, decision.preview);
+            setLastToolCall(decision.lastToolCall);
+            trackRecentCommit();
+          }
         }
         if (isTestRun(command)) {
           const passed = !event.isError;

@@ -50,6 +50,12 @@ export interface AgentMailMessage {
   text: string;
   timestamp: string;
   replyTo: string | null;
+  /** Trusted dispatch reservation attached to a task-assignment message. */
+  dispatchToken?: string;
+  /** Task this dispatch assignment is for. */
+  taskId?: string;
+  /** Warm lobby instance the orchestrator recorded for the assignment. */
+  lobbyId?: string;
 }
 
 interface AgentMailMessageInput {
@@ -61,6 +67,9 @@ interface AgentMailMessageInput {
   timestamp?: unknown;
   ts?: unknown;
   replyTo?: unknown;
+  dispatchToken?: unknown;
+  taskId?: unknown;
+  lobbyId?: unknown;
 }
 
 function stringField(value: unknown, fallback: string): string {
@@ -82,7 +91,52 @@ export function normalizeAgentMailMessage(
     text: stringField(raw.text, stringField(raw.message, "")),
     timestamp: stringField(raw.timestamp, stringField(raw.ts, defaults.timestamp)),
     replyTo: typeof raw.replyTo === "string" ? raw.replyTo : null,
+    ...(typeof raw.dispatchToken === "string" && raw.dispatchToken.length > 0
+      ? { dispatchToken: raw.dispatchToken }
+      : {}),
+    ...(typeof raw.taskId === "string" && raw.taskId.length > 0
+      ? { taskId: raw.taskId }
+      : {}),
+    ...(typeof raw.lobbyId === "string" && raw.lobbyId.length > 0
+      ? { lobbyId: raw.lobbyId }
+      : {}),
   };
+}
+
+export interface MailedDispatchTrust {
+  isCrewWorker: boolean;
+  /** Identity this process registered under (PI_AGENT_NAME). */
+  selfName: string | undefined;
+  /** Warm lobby instance env (PI_LOBBY_ID); absent on cold workers. */
+  lobbyId: string | undefined;
+  /** Current store record for the assignment's task. */
+  task: { status: string; dispatch_token?: string; assigned_to?: string } | null;
+}
+
+/**
+ * Decide whether a dispatch token carried by mail is the live assignment for
+ * this exact worker. Cold workers never trust mail (spawn env is their only
+ * token source), and warm workers must match both the exact task reservation
+ * (task id + token minted at claim) and the lobby instance recorded when the
+ * assignment was written. A forged, delayed or replayed message therefore
+ * cannot replace a newer reservation.
+ */
+export function trustedMailedDispatchToken(
+  msg: AgentMailMessage,
+  trust: MailedDispatchTrust,
+): string | undefined {
+  if (!trust.isCrewWorker) return undefined;
+  if (!trust.lobbyId || !trust.selfName) return undefined;
+  if (msg.from !== "crew-orchestrator") return undefined;
+  if (msg.to !== trust.selfName) return undefined;
+  if (!msg.dispatchToken || !msg.taskId || !msg.lobbyId) return undefined;
+  if (msg.lobbyId !== trust.lobbyId) return undefined;
+  const task = trust.task;
+  if (!task) return undefined;
+  if (task.status !== "in_progress") return undefined;
+  if (task.dispatch_token !== msg.dispatchToken) return undefined;
+  if (task.assigned_to !== trust.selfName) return undefined;
+  return msg.dispatchToken;
 }
 
 export interface ReservationConflict {

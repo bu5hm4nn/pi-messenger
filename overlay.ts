@@ -620,9 +620,9 @@ export class MessengerOverlay implements Component, Focusable {
     const termRows = process.stdout.rows ?? 24;
     const contentHeight = Math.max(8, termRows - chromeLines);
 
-    const prevTs = this.crewViewState.lastSeenEventTs;
+    const prevSeq = this.crewViewState.lastSeenEventSeq;
     const allEvents = readFeedEvents(this.cwd, 20);
-    this.detectAndFlashEvents(allEvents, prevTs);
+    this.detectAndFlashEvents(allEvents, prevSeq);
     this.checkCompletion(tasks, planning);
 
     let contentLines: string[];
@@ -679,7 +679,7 @@ export class MessengerOverlay implements Component, Focusable {
       }
 
       const displayEvents = allEvents.slice(-feedHeight);
-      let feedLines = renderFeedSection(this.theme, displayEvents, sectionW, prevTs);
+      let feedLines = renderFeedSection(this.theme, displayEvents, sectionW, prevSeq);
       if (feedLines.length > feedHeight) feedLines = feedLines.slice(-feedHeight);
 
       while (workerLines.length > 0 && workersHeight() + mainHeight + (feedLines.length > 0 ? feedLines.length + 1 : 0) + agentsHeight > contentHeight) {
@@ -730,9 +730,17 @@ export class MessengerOverlay implements Component, Focusable {
     lines.push(row(renderLegend(this.theme, this.cwd, sectionW, this.crewViewState, selectedTask)));
     lines.push(border("╰" + "─".repeat(innerW) + "╯"));
 
-    if (allEvents.length > 0) {
-      this.crewViewState.lastSeenEventTs = allEvents[allEvents.length - 1].ts;
+    // Advance on event identity, never on timestamp: equal timestamps are
+    // distinct events and must not be skipped. An empty or legacy-only first
+    // render establishes a zero baseline, so the first sequenced batch is not
+    // suppressed by the initial null cursor.
+    let maxSeq = prevSeq;
+    for (const event of allEvents) {
+      if (typeof event.seq === "number" && (maxSeq === null || event.seq > maxSeq)) {
+        maxSeq = event.seq;
+      }
     }
+    this.crewViewState.lastSeenEventSeq = maxSeq ?? 0;
 
     return lines;
   }
@@ -740,42 +748,69 @@ export class MessengerOverlay implements Component, Focusable {
   private static readonly SIGNIFICANT_EVENTS = new Set<FeedEventType>([
     "task.done", "task.block", "task.start", "message",
     "plan.done", "plan.failed", "task.revise", "task.revise-tree",
+    "crew.idle",
   ]);
 
-  private detectAndFlashEvents(events: FeedEvent[], prevTs: string | null): void {
-    if (prevTs === null) return;
-    const newEvents = events.filter(e => e.ts > prevTs);
+  private detectAndFlashEvents(events: FeedEvent[], prevSeq: number | null): void {
+    if (prevSeq === null) return;
+    // Identity, not timestamp: two events sharing a ts (or a clock that steps
+    // backwards) still surface in file order.
+    const newEvents = events.filter(e => typeof e.seq === "number" && e.seq > prevSeq);
     if (newEvents.length === 0) return;
 
     const significant = newEvents.filter(e => MessengerOverlay.SIGNIFICANT_EVENTS.has(e.type));
     if (significant.length === 0) return;
 
-    const last = significant[significant.length - 1];
-    const sameType = significant.filter(e => e.type === last.type);
-
-    let message: string;
-    if (sameType.length > 1) {
-      const label =
-        last.type === "task.done" ? `${sameType.length} tasks completed` :
-        last.type === "task.start" ? `${sameType.length} tasks started` :
-        last.type === "task.block" ? `${sameType.length} tasks blocked` :
-        last.type === "message" ? `${sameType.length} new messages` :
-        `${sameType.length} ${last.type} events`;
-      message = label;
-    } else {
+    const flash = (message: string, idle = false) => {
+      setNotification(this.crewViewState, this.tui, true, message, true, idle);
+    };
+    const singleMessage = (last: FeedEvent): string => {
       const target = last.target ? ` ${last.target}` : "";
       const preview = last.preview ? ` — ${last.preview.slice(0, 40)}` : "";
-      message =
+      return (
         last.type === "task.done" ? `${last.agent} completed${target}` :
         last.type === "task.start" ? `${last.agent} started${target}` :
         last.type === "task.block" ? `${last.agent} blocked${target}${preview}` :
         last.type === "message" ? `${last.agent}${preview || " sent a message"}` :
         last.type === "plan.done" ? "Planning completed" :
         last.type === "plan.failed" ? "Planning failed" :
-        `${last.agent} ${last.type}${target}`;
-    }
+        last.type === "crew.idle" ? "crew idle — outstanding work" :
+        `${last.agent} ${last.type}${target}`
+      );
+    };
 
-    setNotification(this.crewViewState, this.tui, true, message);
+    // Non-idle significant events coalesce within a run of the same type;
+    // every unseen crew.idle transition gets its own flash, so two idle
+    // transitions in one batch both surface instead of collapsing into one.
+    let run: FeedEvent[] = [];
+    const flushRun = () => {
+      if (run.length === 0) return;
+      const last = run[run.length - 1];
+      const count = run.length;
+      const message = count > 1
+        ? (
+          last.type === "task.done" ? `${count} tasks completed` :
+          last.type === "task.start" ? `${count} tasks started` :
+          last.type === "task.block" ? `${count} tasks blocked` :
+          last.type === "message" ? `${count} new messages` :
+          `${count} ${last.type} events`
+        )
+        : singleMessage(last);
+      run = [];
+      flash(message);
+    };
+
+    for (const event of significant) {
+      if (event.type === "crew.idle") {
+        // Flush earlier events first so the order of the batch is preserved.
+        flushRun();
+        flash(singleMessage(event), true);
+        continue;
+      }
+      if (run.length > 0 && run[run.length - 1].type !== event.type) flushRun();
+      run.push(event);
+    }
+    flushRun();
   }
 
   private checkCompletion(tasks: Task[], planning: boolean): void {

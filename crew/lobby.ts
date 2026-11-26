@@ -23,6 +23,8 @@ import {
 } from "./utils/progress.ts";
 import { updateLiveWorker, removeLiveWorker } from "./live-progress.ts";
 import * as store from "./store.ts";
+import { isAutonomousForCwd } from "./state.ts";
+import { getLiveWorkers } from "./registry.ts";
 import { logFeedEvent } from "../feed.ts";
 import {
   registerWorker,
@@ -38,6 +40,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const EXTENSION_DIR = path.resolve(__dirname, "..");
 
+// Idle advisories are transition-based: report on entering the idle state,
+// not on an elapsed-time window, so two distinct transitions inside a couple
+// of seconds both surface. Intentional teardown suppresses detection entirely.
+const idleActive = new Map<string, boolean>();
+const intentionalShutdown = new Set<string>();
+
 export const LOBBY_TOKEN_BUDGETS: Record<string, number> = {
   none: 10_000,
   minimal: 20_000,
@@ -51,14 +59,16 @@ function lobbyTaskId(id: string): string {
   return `__lobby-${id}__`;
 }
 
-export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionModel?: string): LobbyWorker | null {
-  const agents = discoverCrewAgents(cwd);
-  const workerConfig = agents.find(a => a.name === "crew-worker");
-  if (!workerConfig) return null;
+export interface LobbySpawnOptions {
+  /** Task this worker is being spawned for (single-task spawn path). */
+  taskId?: string;
+  /** Dispatch reservation minted for that task. */
+  dispatchToken?: string;
+  /** Pre-allocated display name (the claim records the same identity). */
+  name?: string;
+}
 
-  const crewDir = store.getCrewDir(cwd);
-  const config = loadCrewConfig(crewDir);
-  const id = randomUUID().slice(0, 6);
+function allocateLobbyWorkerName(cwd: string): string {
   let name = generateMemorableName();
   for (let i = 0; i < 5; i++) {
     const existing = registryGetLobbyWorkers(cwd);
@@ -66,9 +76,39 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
     if (!collision) break;
     name = generateMemorableName();
   }
+  return name;
+}
+
+export function spawnLobbyWorker(
+  cwd: string,
+  promptOverride?: string,
+  sessionModel?: string,
+  options?: LobbySpawnOptions,
+): LobbyWorker | null {
+  const agents = discoverCrewAgents(cwd);
+  const workerConfig = agents.find(a => a.name === "crew-worker");
+  if (!workerConfig) return null;
+
+  const crewDir = store.getCrewDir(cwd);
+  const config = loadCrewConfig(crewDir);
+  // A new worker means the crew has left the idle state (and a fresh run is no
+  // longer an intentional shutdown).
+  intentionalShutdown.delete(cwd);
+  idleActive.delete(cwd);
+  const id = randomUUID().slice(0, 6);
+  const name = options?.name ?? allocateLobbyWorkerName(cwd);
   const prompt = promptOverride ?? buildLobbyPrompt(cwd, config);
 
-  const args = ["--mode", "json", "--no-session", "-p"];
+  // `-ne` (--no-extensions) disables automatic extension discovery and the
+  // built-in extensions for the worker session; only explicitly passed
+  // `--extension` paths load. Those paths are EXTENSION_DIR (pi-messenger) plus
+  // path-valued `tools` frontmatter entries of the crew-worker agent. A project
+  // that explicitly lists another extension (intercom, scrumble, …) will load
+  // it — `-ne` guarantees no automatic discovery, not isolation. Without it,
+  // every extension installed for the orchestrator also loads inside the
+  // crew worker and can deliver messages mid-prompt (the intercom/watcher
+  // crash).
+  const args = ["--mode", "json", "--no-session", "-ne", "-p"];
   const model = resolveModel(undefined, undefined, undefined, config.models?.worker, sessionModel, workerConfig.model);
   if (model) pushModelArgs(args, model);
 
@@ -107,7 +147,15 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
   args.push(prompt);
 
   const envOverrides = config.work.env ?? {};
-  const env = { ...process.env, ...envOverrides, PI_AGENT_NAME: name, PI_CREW_WORKER: "1", PI_LOBBY_ID: id };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...envOverrides,
+    PI_AGENT_NAME: name,
+    PI_CREW_WORKER: "1",
+    PI_LOBBY_ID: id,
+    // Dispatch token is attached by the extension; workers never copy it.
+    ...(options?.dispatchToken ? { PI_CREW_DISPATCH: options.dispatchToken } : {}),
+  };
 
   const proc = spawn(getPiCommand(), args, {
     cwd,
@@ -127,7 +175,8 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
     proc,
     taskId,
     startedAt: Date.now(),
-    assignedTaskId: null,
+    assignedTaskId: options?.taskId ?? null,
+    dispatchToken: options?.dispatchToken,
     coordination: config.coordination ?? "chatty",
     promptTmpDir,
     aliveFile,
@@ -168,6 +217,7 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
   });
 
   proc.on("close", (exitCode) => {
+    try {
     const displayId = worker.assignedTaskId ?? taskId;
     removeLiveWorker(cwd, displayId);
     unregisterWorker(cwd, taskId);
@@ -178,25 +228,109 @@ export function spawnLobbyWorker(cwd: string, promptOverride?: string, sessionMo
       try { fs.unlinkSync(worker.aliveFile); } catch {}
     }
     if (worker.assignedTaskId) {
-      const task = store.getTask(cwd, worker.assignedTaskId);
-      if (task && task.status === "in_progress" && task.assigned_to === worker.name) {
-        const config = loadCrewConfig(store.getCrewDir(cwd));
-        if (task.attempt_count >= config.work.maxAttemptsPerTask) {
-          store.updateTask(cwd, worker.assignedTaskId, {
-            status: "blocked",
-            blocked_reason: `Max attempts (${config.work.maxAttemptsPerTask}) reached`,
-            assigned_to: undefined,
-          });
+      // One shared guarded exit: the ownership/token check and the write happen
+      // inside the mutation, so a task that was reassigned or completed while
+      // this worker was dying is left untouched. A guard timeout is logged and
+      // swallowed: a dying worker must never crash the lobby host.
+      const config = loadCrewConfig(store.getCrewDir(cwd));
+      let exit: store.ExitAttemptResult | null = null;
+      try {
+        exit = store.exitAttempt(cwd, worker.assignedTaskId, {
+          owner: worker.name,
+          dispatchToken: worker.dispatchToken,
+          maxAttempts: config.work.maxAttemptsPerTask,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (err instanceof store.TaskLockTimeoutError) {
+          console.error(`[pi-messenger] lobby exit for ${worker.assignedTaskId} timed out: ${message}`);
+        } else {
+          console.error(`[pi-messenger] lobby exit for ${worker.assignedTaskId} failed: ${message}`);
+        }
+      }
+
+      if (exit?.outcome === "blocked" || exit?.outcome === "todo") {
+        // The shared exit returns the validated prior-attempt snapshot. Record
+        // the reconcile note for BOTH owned outcomes (todo and cap-block), so a
+        // final allowed attempt still carries its base anchor.
+        const prior = exit.previous ?? exit.task;
+        const baseRef = prior?.base_commit ? ` Prior attempt base commit: ${prior.base_commit}.` : "";
+        const neverStarted = exit.previous?.status === "todo";
+        const wording = neverStarted
+          ? "before task.start — work may not have started — verify state before retrying."
+          : "before task.done — indeterminate: work may have landed; verify commits/tests on disk before re-implementing.";
+        const suffix = exit.outcome === "blocked" ? " Blocked at max attempts." : " Reset to todo.";
+        try {
+          store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
+            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}) ${wording}${baseRef}${suffix}`);
+        } catch (progressErr) {
+          // A dying worker must never crash the lobby host because another
+          // writer holds the progress append path.
+          console.error(`[pi-messenger] lobby progress note for ${worker.assignedTaskId} failed: ${progressErr instanceof Error ? progressErr.message : progressErr}`);
+        }
+        if (exit.outcome === "blocked") {
           logFeedEvent(cwd, worker.name, "task.block", worker.assignedTaskId, `Max attempts reached`);
         } else {
-          store.updateTask(cwd, worker.assignedTaskId, { status: "todo", assigned_to: undefined });
-          store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
-            `Lobby worker ${worker.name} exited (code ${exitCode ?? "unknown"}), reset to todo`);
           logFeedEvent(cwd, worker.name, "task.reset", worker.assignedTaskId, "worker exited");
+        }
+      } else if (exit?.outcome === "changed") {
+        // Owner/token mismatch: only the rejection reason, never a reset or
+        // reconcile note that could be mistaken for this worker's attempt.
+        const current = store.getTask(cwd, worker.assignedTaskId);
+        try {
+          store.appendTaskProgress(cwd, worker.assignedTaskId, "system",
+            `Ignored stale exit from ${worker.name}: task holds a different reservation or completion (status ${current?.status ?? "missing"}); left untouched.`);
+        } catch (progressErr) {
+          console.error(`[pi-messenger] lobby stale-exit note for ${worker.assignedTaskId} failed: ${progressErr instanceof Error ? progressErr.message : progressErr}`);
         }
       }
     } else {
       logFeedEvent(cwd, worker.name, "leave", undefined, `Lobby worker exited (code ${exitCode ?? "unknown"})`);
+    }
+    // Crew-empty detection: fires from the lobby close handler only — regular
+    // spawnAgents workers are awaited synchronously by work.execute(), so a
+    // lobby worker exiting autonomously is the one case where the orchestrator
+    // is NOT already in control and an idle advisory is meaningful.
+    // Intentional teardown (session shutdown) suppresses it: those close
+    // handlers can run while the autonomous flag is still set, but they are
+    // not a crew going idle. Node serializes close handlers, so marking
+    // idleActive on the first report suppresses duplicate simultaneous exits;
+    // a later lobby-worker spawn clears the flag, allowing the next genuine
+    // transition to report.
+    try {
+      if (intentionalShutdown.has(cwd)) {
+        idleActive.delete(cwd);
+        return;
+      }
+      if (isAutonomousForCwd(cwd)) {
+        // getLiveWorkers treats any process that has not exited as live.
+        // Deliberately no !proc.killed check: `killed` means a signal was sent,
+        // not that the process died — excluding such workers could fire idle
+        // while a shutdown-in-flight worker is still running.
+        const liveOthers = getLiveWorkers(cwd).filter(w => w !== worker);
+        const outstanding = store.getTasks(cwd).filter(t => t.status === "todo" || t.status === "in_progress");
+        const idleNow = liveOthers.length === 0 && outstanding.length > 0;
+        if (!idleNow) {
+          idleActive.set(cwd, false);
+          return;
+        }
+        if (idleActive.get(cwd)) return;
+        // Mark the transition reported only after the append actually landed.
+        // A feed-lock timeout leaves it unreported so a later close re-emits the
+        // same transition; a successful append gates the re-emit.
+        const reported = logFeedEvent(cwd, "crew", "crew.idle", undefined,
+          `All crew workers exited with outstanding work: ${outstanding.map(t => t.id).join(", ")}. Autonomous continuation should resume them; if the session stopped, run pi_messenger({ action: "work", autonomous: true }).`);
+        if (reported) idleActive.set(cwd, true);
+      } else {
+        idleActive.set(cwd, false);
+      }
+    } catch (e) {
+      console.error(`[pi-messenger] crew.idle detection failed: ${e instanceof Error ? e.message : e}`);
+    }
+    } catch (e) {
+      // The close callback runs in the orchestrator's process and must never
+      // throw: log and leave the reservation for the next recovery pass.
+      console.error(`[pi-messenger] lobby close handler failed: ${e instanceof Error ? e.message : e}`);
     }
   });
 
@@ -224,6 +358,7 @@ export function assignTaskToLobbyWorker(
   taskId: string,
   taskPrompt: string,
   inboxDir: string,
+  dispatchToken?: string,
 ): boolean {
   if (worker.assignedTaskId) return false;
   if (worker.proc.exitCode !== null) return false;
@@ -244,6 +379,11 @@ Drop your current activity and work on this task immediately.
 ${taskPrompt}`,
     timestamp: new Date().toISOString(),
     replyTo: null,
+    // Structured (not prompt text) so the worker extension can attach the
+    // trusted reservation to task.done/block/reset without the model typing it.
+    // The task id and lobby instance let the receiver verify the message
+    // against the live reservation and the exact warm worker it was written for.
+    ...(dispatchToken ? { dispatchToken, taskId, lobbyId: worker.lobbyId } : {}),
   };
 
   const random = Math.random().toString(36).substring(2, 8);
@@ -263,6 +403,10 @@ ${taskPrompt}`,
 
   removeLiveWorker(worker.cwd, lobbyTaskId(worker.lobbyId));
   worker.assignedTaskId = taskId;
+  // The warm worker was spawned before the claim, so it has no dispatch token
+  // in its environment. Carry the minted token on the registry entry so the
+  // close handler fences with the reservation rather than a reusable name.
+  worker.dispatchToken = dispatchToken;
   return true;
 }
 
@@ -282,6 +426,10 @@ export function killLobbyWorkerForTask(cwd: string, taskId: string): boolean {
 }
 
 export function shutdownLobbyWorkers(cwd: string): void {
+  // Session shutdown is intentional teardown, not the crew going idle: the
+  // autonomous flag may still be set while close handlers fire.
+  intentionalShutdown.add(cwd);
+  idleActive.delete(cwd);
   const all = registryGetLobbyWorkers(cwd);
   for (const worker of all) {
     if (worker.proc.exitCode === null) {
@@ -324,25 +472,62 @@ export function spawnWorkerForTask(
   sessionModel?: string,
 ): LobbyWorker | null {
   const task = store.getTask(cwd, taskId);
-  if (!task || task.status !== "todo") return null;
+  if (!task || task.status !== "todo" || task.dispatch_token) return null;
   if (hasActiveWorker(cwd, taskId)) return null;
 
-  const worker = spawnLobbyWorker(cwd, taskPrompt, sessionModel);
-  if (!worker) return null;
+  const config = loadCrewConfig(store.getCrewDir(cwd));
+  // The worker identity must exist before the claim: the reservation records
+  // assigned_to, and both task.start and the receipt are fenced by it.
+  const workerName = allocateLobbyWorkerName(cwd);
+  let claimed: Awaited<ReturnType<typeof store.claimTaskForDispatch>>;
+  try {
+    claimed = store.claimTaskForDispatch(cwd, taskId, workerName, {
+      maxAttempts: config.work.maxAttemptsPerTask,
+    });
+  } catch (err) {
+    // A guard timeout rejects only this spawn; callers continue their loop.
+    if (err instanceof store.TaskLockTimeoutError) return null;
+    throw err;
+  }
+  if (!claimed || !claimed.dispatch_token) return null;
+  const dispatchToken = claimed.dispatch_token;
+
+  const baseCommit = store.getBaseCommit(cwd); // git never runs inside the guard
+  let started: Awaited<ReturnType<typeof store.startTask>>;
+  try {
+    started = store.startTask(cwd, taskId, workerName, { baseCommit, dispatchToken });
+  } catch (err) {
+    if (err instanceof store.TaskLockTimeoutError) {
+      try { store.releaseDispatch(cwd, taskId, dispatchToken); } catch {}
+      return null;
+    }
+    throw err;
+  }
+  if (!started) {
+    store.releaseDispatch(cwd, taskId, dispatchToken);
+    return null;
+  }
+
+  const worker = spawnLobbyWorker(cwd, taskPrompt, sessionModel, {
+    taskId,
+    dispatchToken,
+    name: workerName,
+  });
+  if (!worker) {
+    // Launch failed after the claim: release this dispatch's reservation.
+    store.exitAttempt(cwd, taskId, {
+      owner: workerName,
+      dispatchToken,
+      maxAttempts: config.work.maxAttemptsPerTask,
+    });
+    return null;
+  }
 
   removeLiveWorker(cwd, lobbyTaskId(worker.lobbyId));
-  worker.assignedTaskId = taskId;
   if (worker.aliveFile) {
     try { fs.unlinkSync(worker.aliveFile); } catch {}
   }
-  store.updateTask(cwd, taskId, {
-    status: "in_progress",
-    started_at: new Date().toISOString(),
-    base_commit: store.getBaseCommit(cwd),
-    assigned_to: worker.name,
-    attempt_count: task.attempt_count + 1,
-  });
-  store.appendTaskProgress(cwd, taskId, "system", `Assigned to worker ${worker.name} (attempt ${task.attempt_count + 1})`);
+  store.appendTaskProgress(cwd, taskId, "system", `Assigned to worker ${worker.name} (attempt ${claimed.attempt_count})`);
   logFeedEvent(cwd, worker.name, "task.start", taskId, task.title);
 
   return worker;

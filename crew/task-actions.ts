@@ -8,6 +8,10 @@ export type TaskAction = "start" | "block" | "unblock" | "reset" | "cascade-rese
 
 export interface TaskActionOptions {
   isWorkerActive?: (taskId: string) => boolean;
+  /** Dispatch reservation carried by a spawned worker (PI_CREW_DISPATCH). */
+  dispatchToken?: string;
+  /** Override crew-identity detection (tests); production uses the env vars. */
+  crewIdentity?: boolean;
 }
 
 export interface TaskActionResult {
@@ -29,6 +33,28 @@ export function executeTaskAction(
 ): TaskActionResult {
   const task = store.getTask(cwd, taskId);
   if (!task) return { success: false, error: "not_found", message: `Task ${taskId} not found` };
+
+  // A worker session (cold or warm) has a crew identity. If it presents no
+  // token while the task holds a live reservation, it must not fall back to
+  // the unfenced operator path: that path is reserved for sessions with no
+  // crew identity at all (an explicit human/operator takeover).
+  const hasCrewIdentity = options?.crewIdentity
+    ?? (process.env.PI_CREW_WORKER === "1" || process.env.PI_LOBBY_ID !== undefined);
+  const hasDispatchToken = typeof options?.dispatchToken === "string" && options.dispatchToken.length > 0;
+  const tokenBearing = typeof task.dispatch_token === "string" && task.dispatch_token.length > 0;
+  const TOKEN_GATED_ACTIONS: ReadonlySet<TaskAction> = new Set([
+    "start", "block", "unblock", "reset", "cascade-reset", "stop",
+  ]);
+  if (hasCrewIdentity && !hasDispatchToken && tokenBearing && TOKEN_GATED_ACTIONS.has(action)) {
+    return {
+      success: false,
+      error: "dispatch_token_required",
+      message:
+        `Refusing ${action} on ${taskId}: worker ${agentName} has crew identity but no dispatch token, ` +
+        `while task holds reservation ${task.dispatch_token!.slice(0, 8)}. ` +
+        `A tokenless takeover is reserved for operator sessions with no crew identity.`,
+    };
+  }
 
   switch (action) {
     case "start": {
@@ -53,7 +79,12 @@ export function executeTaskAction(
           };
         }
       }
-      const started = store.startTask(cwd, taskId, agentName);
+      // git runs before the guard: no spawn/git inside a mutation.
+      const baseCommit = store.getBaseCommit(cwd);
+      const started = store.startTask(cwd, taskId, agentName, {
+        baseCommit,
+        dispatchToken: options?.dispatchToken,
+      });
       if (!started) return { success: false, error: "start_failed", message: `Failed to start ${taskId}` };
       logFeedEvent(cwd, agentName, "task.start", taskId, started.title);
       return { success: true, message: `Started ${taskId}`, task: started };
@@ -66,7 +97,11 @@ export function executeTaskAction(
       if (!reason) {
         return { success: false, error: "missing_reason", message: `Reason required to block ${taskId}` };
       }
-      const blocked = store.blockTask(cwd, taskId, reason);
+      // A worker session carries the trusted dispatch token; the mutation
+      // re-checks it under the guard so a same-name successor is untouched.
+      const blocked = store.blockTask(cwd, taskId, reason, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (!blocked) return { success: false, error: "block_failed", message: `Failed to block ${taskId}` };
       logFeedEvent(cwd, agentName, "task.block", taskId, reason);
       return { success: true, message: `Blocked ${taskId}`, task: blocked };
@@ -76,7 +111,9 @@ export function executeTaskAction(
       if (task.status !== "blocked") {
         return { success: false, error: "invalid_status", message: `Task ${taskId} is ${task.status}, not blocked` };
       }
-      const unblocked = store.unblockTask(cwd, taskId);
+      const unblocked = store.unblockTask(cwd, taskId, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (!unblocked) return { success: false, error: "unblock_failed", message: `Failed to unblock ${taskId}` };
       logFeedEvent(cwd, agentName, "task.unblock", taskId, unblocked.title);
       return { success: true, message: `Unblocked ${taskId}`, task: unblocked };
@@ -86,7 +123,9 @@ export function executeTaskAction(
       if (options?.isWorkerActive?.(taskId)) {
         return { success: false, error: "active_worker", message: `Cannot reset ${taskId} while its worker is active` };
       }
-      const resetTasks = store.resetTask(cwd, taskId, false);
+      const resetTasks = store.resetTask(cwd, taskId, false, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (resetTasks.length === 0) return { success: false, error: "reset_failed", message: `Failed to reset ${taskId}` };
       logFeedEvent(cwd, agentName, "task.reset", taskId, task.title);
       return { success: true, message: `Reset ${taskId}`, resetTasks };
@@ -98,7 +137,11 @@ export function executeTaskAction(
       if (activeTask) {
         return { success: false, error: "active_worker", message: `Cannot reset ${activeTask.id} while its worker is active` };
       }
-      const resetTasks = store.resetTask(cwd, taskId, true);
+      // The worker's token fences the root takeover; dependent resets remain
+      // part of the same explicit cascade once the root is accepted.
+      const resetTasks = store.resetTask(cwd, taskId, true, {
+        ...(options?.dispatchToken ? { dispatchToken: options.dispatchToken } : {}),
+      });
       if (resetTasks.length === 0) return { success: false, error: "reset_failed", message: `Failed to reset ${taskId}` };
       logFeedEvent(cwd, agentName, "task.reset", taskId, `cascade (${resetTasks.length} tasks)`);
       return { success: true, message: `Reset ${taskId} + ${Math.max(0, resetTasks.length - 1)} dependents`, resetTasks };
@@ -123,7 +166,9 @@ export function executeTaskAction(
       } else {
         store.appendTaskProgress(cwd, taskId, agentName, "Task unassigned (no active worker)");
       }
-      store.updateTask(cwd, taskId, { status: "todo", assigned_to: undefined });
+      // Stop is an explicit takeover: reset through the lifecycle mutation so
+      // the active dispatch token and completion attribution are invalidated.
+      store.resetTask(cwd, taskId);
       logFeedEvent(cwd, agentName, "task.reset", taskId, "stopped");
       return { success: true, message: `Stopped ${taskId}` };
     }

@@ -34,6 +34,7 @@ import { autonomousState, waitForConcurrencyChange } from "./state.ts";
 import { registerWorker, unregisterWorker, killAll } from "./registry.ts";
 import type { AgentTask, AgentResult } from "./types.ts";
 import { generateMemorableName } from "../lib.ts";
+import * as crewStore from "./store.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -163,6 +164,28 @@ export async function spawnAgents(
           results.push(result);
           running.splice(running.indexOf(promise), 1);
           options.onProgress?.(results);
+        })
+        .catch((error: unknown) => {
+          // Never let one launch rejection discard receipts from workers that
+          // already started: synthesize a per-task failure and keep draining.
+          const message = error instanceof Error ? error.message : String(error);
+          const timedOut = error instanceof crewStore.TaskLockTimeoutError;
+          const progress = createProgress(task.agent);
+          progress.status = "failed";
+          progress.error = message;
+          results.push({
+            agent: task.agent,
+            exitCode: 1,
+            output: "",
+            truncated: false,
+            progress,
+            taskId: task.taskId,
+            workerName: task.workerName ?? generateMemorableName(),
+            ...(timedOut ? { errorCode: "task_lock_timeout" } : {}),
+            error: message,
+          });
+          running.splice(running.indexOf(promise), 1);
+          options.onProgress?.(results);
         });
       running.push(promise);
     }
@@ -188,7 +211,86 @@ async function runAgent(
   const agentConfig = agents.find(a => a.name === task.agent);
   const progress = createProgress(task.agent);
   const startTime = Date.now();
-  const workerName = generateMemorableName();
+  // work.execute pre-generates a unique dispatch identity (memorable display
+  // name plus a random suffix) so the task, PI_AGENT_NAME and the result carry
+  // the same value; other spawn callers let runAgent generate a display name.
+  const workerName = task.workerName ?? generateMemorableName();
+
+  // Persist dispatch ownership at the actual launch point, not while the wave
+  // queue is built: a task cancelled before this line must keep no assignee.
+  // claimTaskForDispatch re-reads under the per-task guard; if another process
+  // claimed it first, skip this launch instead of spawning a duplicate worker.
+  let dispatchToken: string | undefined;
+  if (task.workerName && task.taskId) {
+    const current = crewStore.getTask(cwd, task.taskId);
+    if (!current) {
+      // Missing task at launch: never spawn a worker for a task file that no
+      // longer exists (it would write bookkeeping for a ghost).
+      const reason = `Dispatch skipped: ${task.taskId} no longer exists`;
+      progress.status = "failed";
+      progress.error = reason;
+      progress.durationMs = Date.now() - startTime;
+      return {
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        taskId: task.taskId,
+        workerName,
+        skipped: true,
+        error: reason,
+      };
+    }
+    let claimed: Awaited<ReturnType<typeof crewStore.claimTaskForDispatch>>;
+    try {
+      claimed = crewStore.claimTaskForDispatch(cwd, task.taskId, workerName, {
+        maxAttempts: config.work.maxAttemptsPerTask,
+      });
+    } catch (err) {
+      if (!(err instanceof crewStore.TaskLockTimeoutError)) throw err;
+      // Typed per-task failure: this launch is rejected, but the batch keeps
+      // draining the workers that did launch.
+      const reason = `Dispatch claim timed out for ${task.taskId}: ${err.message}`;
+      progress.status = "failed";
+      progress.error = reason;
+      progress.durationMs = Date.now() - startTime;
+      return {
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        taskId: task.taskId,
+        workerName,
+        errorCode: "task_lock_timeout",
+        error: reason,
+      };
+    }
+    if (!claimed) {
+      const now = crewStore.getTask(cwd, task.taskId);
+      const reason = now?.dispatch_token
+        ? `Dispatch skipped: ${task.taskId} is reserved for another dispatch`
+        : `Dispatch skipped: ${task.taskId} is ${now?.status ?? "unknown"}, not todo (or out of attempts)`;
+      progress.status = "failed";
+      progress.error = reason;
+      progress.durationMs = Date.now() - startTime;
+      return {
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        taskId: task.taskId,
+        workerName,
+        skipped: true,
+        error: reason,
+      };
+    }
+    dispatchToken = claimed.dispatch_token;
+    crewStore.appendTaskProgress(cwd, task.taskId, "system",
+      `Assigned to ${task.agent} ${workerName}`);
+  }
 
   const role = agentConfig?.crewRole ?? "worker";
   const maxOutput = task.maxOutput
@@ -208,8 +310,14 @@ async function runAgent(
   }
 
   return new Promise((resolve) => {
-    // Build args for pi command
-    const args = ["--mode", "json", "--no-session", "-p"];
+    // Build args for pi command.
+    // `-ne` (--no-extensions) disables automatic extension discovery and the
+    // built-in extensions for the worker session; only explicitly passed
+    // `--extension` paths load. Those paths are EXTENSION_DIR (pi-messenger)
+    // plus path-valued `tools` frontmatter entries of the spawned agent, so a
+    // project that explicitly lists another extension (intercom, scrumble, …)
+    // will load it — `-ne` guarantees no automatic discovery, not isolation.
+    const args = ["--mode", "json", "--no-session", "-ne", "-p"];
     const model = task.modelOverride ?? config.models?.[role] ?? agentConfig?.model;
     if (model) pushModelArgs(args, model);
 
@@ -254,18 +362,51 @@ async function runAgent(
     args.push(task.task);
 
     const envOverrides = config.work.env ?? {};
-    const workerFlag = role === "worker"
-      ? { PI_CREW_WORKER: "1", PI_AGENT_NAME: workerName }
-      : {};
-    const env = Object.keys(envOverrides).length > 0 || role === "worker"
+    const workerFlag: Record<string, string> = {};
+    if (role === "worker") workerFlag.PI_CREW_WORKER = "1";
+    // An explicitly supplied dispatch identity must reach the worker even if a
+    // project override renamed crewRole, so task.start can record the same
+    // assigned_to the receipt carries.
+    if (task.workerName) workerFlag.PI_AGENT_NAME = task.workerName;
+    else if (role === "worker") workerFlag.PI_AGENT_NAME = workerName;
+    // The reservation token is attached by the extension, never copied by the
+    // model: task.start/task.done read it from the environment.
+    if (dispatchToken) workerFlag.PI_CREW_DISPATCH = dispatchToken;
+    const env = Object.keys(envOverrides).length > 0 || Object.keys(workerFlag).length > 0
       ? { ...process.env, ...envOverrides, ...workerFlag }
       : undefined;
 
-    const proc = spawn(getPiCommand(), args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-      ...(env ? { env } : {}),
-    });
+    let proc;
+    try {
+      proc = spawn(getPiCommand(), args, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(env ? { env } : {}),
+      });
+    } catch (err) {
+      // Launch failed after the claim: release the reservation so the task is
+      // dispatchable again (only if the token still matches).
+      if (dispatchToken && task.taskId) {
+        try { crewStore.releaseDispatch(cwd, task.taskId, dispatchToken); } catch {}
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      progress.status = "failed";
+      progress.error = message;
+      progress.durationMs = Date.now() - startTime;
+      resolve({
+        agent: task.agent,
+        exitCode: 1,
+        output: "",
+        truncated: false,
+        progress,
+        config: agentConfig,
+        taskId: task.taskId,
+        workerName,
+        dispatchToken,
+        error: message,
+      });
+      return;
+    }
     if (task.taskId) {
       registerWorker({ type: "worker", proc, name: workerName, cwd, taskId: task.taskId });
     }
@@ -359,6 +500,8 @@ async function runAgent(
         progress,
         config: agentConfig,
         taskId: task.taskId,
+        workerName,
+        dispatchToken,
         wasGracefullyShutdown: gracefulShutdownRequested,
         error: progress.error,
         artifactPaths: artifactPaths ? {

@@ -51,20 +51,31 @@ export function spawnWorkersForReadyTasks(
     const others = fresh.filter(t => t.id !== task.id);
     const prompt = buildWorkerPrompt(task, prdLabel, cwd, config, others, skills, teamStore.buildTeamPromptContext(cwd, task));
 
-    store.updateTask(cwd, task.id, {
-      status: "in_progress",
-      started_at: new Date().toISOString(),
-      base_commit: store.getBaseCommit(cwd),
-      assigned_to: lw.name,
-      attempt_count: task.attempt_count + 1,
+    // A lobby claim IS a dispatch: reserve, charge the attempt once, then
+    // start; a failed delivery releases this dispatch's reservation.
+    const claimed = store.claimTaskForDispatch(cwd, task.id, lw.name, {
+      maxAttempts: config.work.maxAttemptsPerTask,
     });
+    if (!claimed || !claimed.dispatch_token) continue;
+    const dispatchToken = claimed.dispatch_token;
 
-    if (!assignTaskToLobbyWorker(lw, task.id, prompt, inboxDir)) {
-      store.updateTask(cwd, task.id, { status: "todo", assigned_to: undefined });
+    const baseCommit = store.getBaseCommit(cwd);
+    const started = store.startTask(cwd, task.id, lw.name, { baseCommit, dispatchToken });
+    if (!started) {
+      store.releaseDispatch(cwd, task.id, dispatchToken);
       continue;
     }
 
-    store.appendTaskProgress(cwd, task.id, "system", `Assigned to lobby worker ${lw.name} (attempt ${task.attempt_count + 1})`);
+    if (!assignTaskToLobbyWorker(lw, task.id, prompt, inboxDir, dispatchToken)) {
+      store.exitAttempt(cwd, task.id, {
+        owner: lw.name,
+        dispatchToken,
+        maxAttempts: config.work.maxAttemptsPerTask,
+      });
+      continue;
+    }
+
+    store.appendTaskProgress(cwd, task.id, "system", `Assigned to lobby worker ${lw.name} (attempt ${claimed.attempt_count})`);
     logFeedEvent(cwd, lw.name, "task.start", task.id, task.title);
     if (!firstWorkerName) firstWorkerName = lw.name;
     assigned++;

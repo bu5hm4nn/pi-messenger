@@ -49,12 +49,12 @@ async function createReviewedTask(): Promise<Fixture> {
   const base = initRepo(cwd);
   store.createPlan(cwd, "docs/PRD.md");
   const task = store.createTask(cwd, "Build feature");
-  store.updateTask(cwd, task.id, {
-    status: "done",
-    base_commit: base,
-    assigned_to: "TestWorker",
-    attempt_count: 1,
+  const claimed = store.claimTaskForDispatch(cwd, task.id, "TestWorker");
+  store.startTask(cwd, task.id, "TestWorker", {
+    baseCommit: base,
+    dispatchToken: claimed?.dispatch_token,
   });
+  store.completeTask(cwd, task.id, "Done", undefined, "TestWorker", { dispatchToken: claimed?.dispatch_token });
 
   // crew-reviewer agent so reviewImplementation passes discovery
   const agentsDir = path.join(cwd, ".pi", "messenger", "crew", "agents");

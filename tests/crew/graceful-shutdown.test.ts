@@ -135,8 +135,10 @@ describe("crew/graceful shutdown", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
 
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async () => {
-      store.updateTask(dirs.cwd, task.id, { status: "in_progress", assigned_to: "crew-worker" });
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      store.claimTaskForDispatch(dirs.cwd, task.id, workerName);
+      store.startTask(dirs.cwd, task.id, workerName);
       return [{
         agent: "crew-worker",
         exitCode: 0,
@@ -151,6 +153,7 @@ describe("crew/graceful shutdown", () => {
           durationMs: 0,
         },
         taskId: task.id,
+        workerName,
         wasGracefullyShutdown: true,
       }];
     });
@@ -165,7 +168,8 @@ describe("crew/graceful shutdown", () => {
     const reloaded = store.getTask(dirs.cwd, task.id);
     expect(reloaded?.status).toBe("todo");
     expect(reloaded?.assigned_to).toBeUndefined();
-    expect(response.details.failed).toEqual([task.id]);
+    expect(response.details.indeterminate).toEqual([task.id]);
+    expect(response.details.failed).toEqual([]);
     expect(response.details.blocked).toEqual([]);
   });
 
@@ -180,10 +184,13 @@ describe("crew/graceful shutdown", () => {
     const t2 = store.createTask(dirs.cwd, "Task two", "Desc two");
 
     let call = 0;
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async () => {
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       call++;
+      const workerName = tasks[0]?.workerName!;
+      const claimed = store.claimTaskForDispatch(dirs.cwd, tasks[0]?.taskId!, workerName);
       if (call === 1) {
-        store.updateTask(dirs.cwd, t1.id, { status: "done" });
+        store.startTask(dirs.cwd, t1.id, workerName, { dispatchToken: claimed?.dispatch_token });
+        store.completeTask(dirs.cwd, t1.id, "Done", undefined, workerName, { dispatchToken: claimed?.dispatch_token });
         return [{
           agent: "crew-worker",
           exitCode: 1,
@@ -198,12 +205,13 @@ describe("crew/graceful shutdown", () => {
             durationMs: 0,
           },
           taskId: t1.id,
+          workerName,
           wasGracefullyShutdown: true,
           error: "terminated",
         }];
       }
 
-      store.updateTask(dirs.cwd, t2.id, { status: "in_progress", assigned_to: "crew-worker" });
+      store.startTask(dirs.cwd, t2.id, workerName, { dispatchToken: claimed?.dispatch_token });
       return [{
         agent: "crew-worker",
         exitCode: 1,
@@ -218,6 +226,7 @@ describe("crew/graceful shutdown", () => {
           durationMs: 0,
         },
         taskId: t2.id,
+        workerName,
         wasGracefullyShutdown: false,
         error: "crash",
       }];
@@ -263,7 +272,11 @@ describe("crew/graceful shutdown", () => {
     const task = store.createTask(dirs.cwd, "Task one", "Desc one");
 
     vi.spyOn(agents, "spawnAgents").mockImplementation(async () => {
-      store.updateTask(dirs.cwd, task.id, { status: "in_progress", assigned_to: "crew-worker" });
+      // The worker reached task.start before the graceful shutdown.
+      store.mutateTask(dirs.cwd, task.id, () => ({
+        status: "in_progress",
+        assigned_to: "crew-worker",
+      }));
       return [{
         agent: "crew-worker",
         exitCode: 1,
@@ -368,7 +381,11 @@ describe("crew/graceful shutdown", () => {
     vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string }>) => {
       for (const t of tasks) {
         if (t.taskId) {
-          store.updateTask(dirs.cwd, t.taskId, { status: "done" });
+          // Complete through the lifecycle mutation (claim charges the attempt,
+          // start records the owner, done records the attribution).
+          const claimed = store.claimTaskForDispatch(dirs.cwd, t.taskId, "crew-worker");
+          store.startTask(dirs.cwd, t.taskId, "crew-worker", { dispatchToken: claimed?.dispatch_token });
+          store.completeTask(dirs.cwd, t.taskId, "Done", undefined, "crew-worker", { dispatchToken: claimed?.dispatch_token });
         }
       }
       return tasks.map(t => ({
@@ -409,7 +426,7 @@ describe("crew/graceful shutdown", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const t1 = store.createTask(dirs.cwd, "Flaky task", "Keeps failing");
 
-    store.updateTask(dirs.cwd, t1.id, { attempt_count: 5 });
+    store.mutateTask(dirs.cwd, t1.id, () => ({ attempt_count: 5 }));
 
     const spawnSpy = vi.spyOn(agents, "spawnAgents").mockImplementation(async () => []);
 
@@ -436,9 +453,9 @@ describe("crew/graceful shutdown", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const t1 = store.createTask(dirs.cwd, "Abandoned task", "Worker forgot task.done");
 
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string }>) => {
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
-        if (t.taskId) store.startTask(dirs.cwd, t.taskId, "Worker");
+        if (t.taskId) store.startTask(dirs.cwd, t.taskId, t.workerName!);
       }
       return tasks.map(t => ({
         agent: "crew-worker",
@@ -454,6 +471,7 @@ describe("crew/graceful shutdown", () => {
           durationMs: 0,
         },
         taskId: t.taskId,
+        workerName: t.workerName,
       }));
     });
 
@@ -467,10 +485,10 @@ describe("crew/graceful shutdown", () => {
     const reloaded = store.getTask(dirs.cwd, t1.id);
     expect(reloaded?.status).toBe("todo");
     expect(reloaded?.assigned_to).toBeUndefined();
-    expect(response.details.failed).toEqual([t1.id]);
+    expect(response.details.indeterminate).toEqual([t1.id]);
   });
 
-  it("graceful shutdown with non-zero exit and in_progress task resets to todo and reports failed", async () => {
+  it("graceful shutdown with non-zero exit and in_progress task resets to todo and reports indeterminate", async () => {
     const store = await import("../../crew/store.ts");
     const agents = await import("../../crew/agents.ts");
     const workHandler = await import("../../crew/handlers/work.ts");
@@ -479,9 +497,9 @@ describe("crew/graceful shutdown", () => {
     store.createPlan(dirs.cwd, "docs/PRD.md");
     const t1 = store.createTask(dirs.cwd, "Interrupted task", "Graceful non-zero");
 
-    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string }>) => {
+    vi.spyOn(agents, "spawnAgents").mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
       for (const t of tasks) {
-        if (t.taskId) store.startTask(dirs.cwd, t.taskId, "Worker");
+        if (t.taskId) store.startTask(dirs.cwd, t.taskId, t.workerName!);
       }
       return tasks.map(t => ({
         agent: "crew-worker",
@@ -497,6 +515,7 @@ describe("crew/graceful shutdown", () => {
           durationMs: 0,
         },
         taskId: t.taskId,
+        workerName: t.workerName,
         wasGracefullyShutdown: true,
         error: "terminated",
       }));
@@ -512,7 +531,7 @@ describe("crew/graceful shutdown", () => {
     const reloaded = store.getTask(dirs.cwd, t1.id);
     expect(reloaded?.status).toBe("todo");
     expect(reloaded?.assigned_to).toBeUndefined();
-    expect(response.details.failed).toEqual([t1.id]);
+    expect(response.details.indeterminate).toEqual([t1.id]);
     expect(response.details.blocked).toEqual([]);
   });
 });

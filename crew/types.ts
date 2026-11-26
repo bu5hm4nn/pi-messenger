@@ -66,10 +66,30 @@ export interface Task {
   assigned_to?: string;          // Agent name currently working on it
   summary?: string;              // Completion summary from task.done
   evidence?: TaskEvidence;       // Evidence from task.done
+  completed_by?: string;         // Worker identity that called task.done
   blocked_reason?: string;       // Reason from task.block
   attempt_count: number;         // How many times attempted (for auto-block)
   review_count?: number;         // How many times reviewed
   last_review?: ReviewFeedback;  // Feedback from last review (for retry)
+  /** Live dispatch reservation. Present only while a claim is outstanding. */
+  dispatch_token?: string;
+  /** Dispatch token that produced the current completion (review attribution). */
+  completed_dispatch?: string;
+  /** Monotonic document revision, bumped by every guarded task write. */
+  rev?: number;
+  /** Spec generation, bumped on every spec edit (stale-edit precondition). */
+  generation?: number;
+  /**
+   * Spec layout version. 0/undefined means the legacy `<id>.md` file; positive
+   * values select `<id>.spec.<version>.md`. The task JSON is the only pointer,
+   * so readers can never combine a newer generation with older content.
+   */
+  spec_version?: number;
+  /**
+   * A split has been accepted but its milestone links are not committed yet.
+   * Claims, starts and milestone auto-completion must refuse this task.
+   */
+  pending_split?: boolean;
 }
 
 export interface ReviewFeedback {
@@ -167,6 +187,10 @@ export interface AgentTask {
   taskId?: string;
   modelOverride?: string;
   maxOutput?: MaxOutputConfig;
+  /** Runtime worker identity; becomes PI_AGENT_NAME and the task's assigned_to. */
+  workerName?: string;
+  /** Dispatch reservation to start; minted at the launch point when omitted. */
+  dispatchToken?: string;
 }
 
 export interface AgentResult {
@@ -177,6 +201,14 @@ export interface AgentResult {
   progress: AgentProgress;
   config?: CrewAgentConfig;
   taskId?: string;
+  /** Runtime worker identity (PI_AGENT_NAME) used to fence stale receipts. */
+  workerName?: string;
+  /** Dispatch token reserved for this launch (fences its receipts). */
+  dispatchToken?: string;
+  /** Dispatch was abandoned because the task was no longer claimable. */
+  skipped?: boolean;
+  /** Typed per-task launch failure (e.g. "task_lock_timeout"). */
+  errorCode?: string;
   wasGracefullyShutdown?: boolean;
   error?: string;
   artifactPaths?: {

@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as store from "../../crew/store.ts";
 import { createTempCrewDirs, type TempCrewDirs } from "../helpers/temp-dirs.ts";
 
@@ -42,18 +42,45 @@ describe("crew/store", () => {
       expect(fs.existsSync(path.join(dirs.crewDir, "plan.json"))).toBe(true);
       expect(fs.existsSync(path.join(dirs.crewDir, "plan.md"))).toBe(true);
       expect(fs.existsSync(path.join(dirs.tasksDir, `${t1.id}.json`))).toBe(true);
-      expect(fs.existsSync(path.join(dirs.tasksDir, `${t1.id}.md`))).toBe(true);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${t1.id}.spec.1.md`))).toBe(true);
       expect(fs.existsSync(path.join(dirs.tasksDir, `${t2.id}.json`))).toBe(true);
-      expect(fs.existsSync(path.join(dirs.tasksDir, `${t2.id}.md`))).toBe(true);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${t2.id}.spec.1.md`))).toBe(true);
 
       const deleted = store.deletePlan(cwd);
       expect(deleted).toBe(true);
       expect(fs.existsSync(path.join(dirs.crewDir, "plan.json"))).toBe(false);
       expect(fs.existsSync(path.join(dirs.crewDir, "plan.md"))).toBe(false);
       expect(fs.existsSync(path.join(dirs.tasksDir, `${t1.id}.json`))).toBe(false);
-      expect(fs.existsSync(path.join(dirs.tasksDir, `${t1.id}.md`))).toBe(false);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${t1.id}.spec.1.md`))).toBe(false);
       expect(fs.existsSync(path.join(dirs.tasksDir, `${t2.id}.json`))).toBe(false);
-      expect(fs.existsSync(path.join(dirs.tasksDir, `${t2.id}.md`))).toBe(false);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${t2.id}.spec.1.md`))).toBe(false);
+    });
+
+    it("deletePlan skips a task whose guard is held, leaving its complete file set intact", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const heldTask = store.createTask(cwd, "Held task", "Desc");
+      const freeTask = store.createTask(cwd, "Free task", "Desc");
+      store.appendTaskProgress(cwd, heldTask.id, "WorkerA", "in flight");
+      store.blockTask(cwd, heldTask.id, "blocked for test");
+
+      const heldJson = path.join(dirs.tasksDir, `${heldTask.id}.json`);
+      const heldSpec = path.join(dirs.tasksDir, `${heldTask.id}.spec.1.md`);
+      const heldProgress = path.join(dirs.tasksDir, `${heldTask.id}.progress.md`);
+      const heldBlock = path.join(dirs.blocksDir, `${heldTask.id}.md`);
+      const guard = store.acquireTaskGuard(cwd, heldTask.id);
+
+      try {
+        expect(store.deletePlan(cwd)).toBe(true);
+      } finally {
+        store.releaseTaskGuard(guard);
+      }
+
+      expect(fs.existsSync(heldJson)).toBe(true);
+      expect(fs.existsSync(heldSpec)).toBe(true);
+      expect(fs.existsSync(heldProgress)).toBe(true);
+      expect(fs.existsSync(heldBlock)).toBe(true);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${freeTask.id}.json`))).toBe(false);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${freeTask.id}.spec.1.md`))).toBe(false);
     });
 
     it("hasPlan returns false when no plan exists", () => {
@@ -72,9 +99,134 @@ describe("crew/store", () => {
       expect(t1.id).toBe("task-1");
       expect(t2.id).toBe("task-2");
       expect(fs.existsSync(path.join(dirs.tasksDir, "task-1.json"))).toBe(true);
-      expect(fs.existsSync(path.join(dirs.tasksDir, "task-1.md"))).toBe(true);
+      // New tasks publish a generation-named spec selected by their JSON.
+      expect(fs.existsSync(path.join(dirs.tasksDir, "task-1.spec.1.md"))).toBe(true);
       expect(fs.existsSync(path.join(dirs.tasksDir, "task-2.json"))).toBe(true);
-      expect(fs.existsSync(path.join(dirs.tasksDir, "task-2.md"))).toBe(true);
+      expect(fs.existsSync(path.join(dirs.tasksDir, "task-2.spec.1.md"))).toBe(true);
+      expect(t1.spec_version).toBe(1);
+      expect(store.getTask(cwd, "task-1")?.spec_version).toBe(1);
+    });
+
+    it("assigns monotonic IDs even when the highest task was deleted", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const t1 = store.createTask(cwd, "Task one", "Description one");
+      const t2 = store.createTask(cwd, "Task two", "Description two");
+
+      expect(store.deleteTask(cwd, t2.id)).toBe(true);
+
+      const t3 = store.createTask(cwd, "Task three", "Description three");
+      expect(t1.id).toBe("task-1");
+      expect(t2.id).toBe("task-2");
+      // The deleted highest ID must not come back with a fresh generation.
+      expect(t3.id).toBe("task-3");
+      expect(store.getTask(cwd, "task-2")).toBeNull();
+    });
+
+    it("an invalid .task-seq never resets below the ids left on disk", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      // A crashed writer left a noncanonical counter and only a non-JSON
+      // artifact for the deleted highest task.
+      fs.writeFileSync(path.join(dirs.tasksDir, ".task-seq"), "not-a-number\n");
+      fs.writeFileSync(path.join(dirs.tasksDir, "task-7.progress.md"), "orphan\n");
+
+      const created = store.createTask(cwd, "After corruption");
+      expect(created.id).toBe("task-8");
+      expect(fs.readFileSync(path.join(dirs.tasksDir, ".task-seq"), "utf-8").trim()).toBe("8");
+    });
+
+    it("reads a legacy spec as generation 0 and migrates on first write", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Legacy task", "Old spec");
+      // Rewrite the record the way pre-versioning tasks were stored.
+      const taskPath = path.join(dirs.tasksDir, `${task.id}.json`);
+      const legacy = { ...task };
+      delete (legacy as { spec_version?: number }).spec_version;
+      fs.writeFileSync(taskPath, JSON.stringify(legacy, null, 2));
+      fs.unlinkSync(path.join(dirs.tasksDir, `${task.id}.spec.1.md`));
+      fs.writeFileSync(path.join(dirs.tasksDir, `${task.id}.md`), "legacy body");
+
+      const raw = store.getTask(cwd, task.id)!;
+      expect(raw.spec_version).toBe(0);
+      expect(store.getTaskSpec(cwd, task.id)).toBe("legacy body");
+
+      expect(store.setTaskSpec(cwd, task.id, "migrated body")).toBe(true);
+      const migrated = store.getTask(cwd, task.id)!;
+      expect(migrated.spec_version).toBe(1);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${task.id}.spec.1.md`))).toBe(true);
+      expect(fs.existsSync(path.join(dirs.tasksDir, `${task.id}.md`))).toBe(false);
+      expect(store.getTaskSpec(cwd, task.id)).toBe("migrated body");
+    });
+
+    it("a failed spec write leaves the old generation readable and the JSON unchanged", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "old body");
+      const oldSpec = store.getTaskSpec(cwd, task.id);
+      // Make the next generation path an un-renameable directory.
+      fs.mkdirSync(path.join(dirs.tasksDir, `${task.id}.spec.2.md`));
+
+      expect(() => store.applyTaskRevision(
+        cwd,
+        task.id,
+        { spec: "new body" },
+        { expectedGeneration: 0 },
+      )).toThrow();
+      const after = store.getTask(cwd, task.id)!;
+      expect(after.spec_version).toBe(1);
+      expect(after.generation).toBe(0);
+      expect(store.getTaskSpec(cwd, task.id)).toBe(oldSpec);
+      expect(fs.readdirSync(dirs.tasksDir).filter(name => name.includes(".tmp-"))).toEqual([]);
+    });
+
+    it("revise and sync against one generation: the loser refuses instead of overwriting", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "base body");
+
+      // The revise path wins generation 0 -> 1.
+      expect(store.applyTaskRevision(cwd, task.id, { spec: "revised body" }, {
+        expectedGeneration: 0,
+      })?.spec_version).toBe(2);
+
+      // The sync path still holds generation 0: it must fail rather than
+      // overwrite the revised generation.
+      expect(() => store.applyTaskRevision(cwd, task.id, { spec: "synced body" }, {
+        expectedGeneration: 0,
+      })).toThrow(store.StaleTaskGenerationError);
+      expect(store.getTaskSpec(cwd, task.id)).toBe("revised body");
+      expect(store.getTask(cwd, task.id)?.generation).toBe(1);
+    });
+
+    it("a reader between the spec write and the JSON commit sees old JSON + old spec", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "old body");
+      const oldSpec = store.getTaskSpec(cwd, task.id);
+      let midVersion: number | undefined;
+      let midSpec: string | null = null;
+
+      // Exercise the same companion-before-JSON mutation contract that
+      // applyTaskRevision uses; the reader runs after the new generation file
+      // exists but before the JSON commit.
+      const updated = store.mutateTask(cwd, task.id, current => ({
+        generation: (current.generation ?? 0) + 1,
+        spec_version: (current.spec_version ?? 0) + 1,
+      }), {
+        prepare: (_current, next) => {
+          fs.writeFileSync(
+            path.join(dirs.tasksDir, `${task.id}.spec.${next.spec_version}.md`),
+            "new body",
+          );
+          midVersion = store.getTask(cwd, task.id)?.spec_version;
+          midSpec = store.getTaskSpec(cwd, task.id);
+        },
+        afterCommit: next => {
+          fs.unlinkSync(path.join(dirs.tasksDir, `${task.id}.spec.1.md`));
+          void next;
+        },
+      });
+
+      expect(updated).not.toBeNull();
+      expect(midVersion).toBe(1);
+      expect(midSpec).toBe(oldSpec);
+      expect(store.getTaskSpec(cwd, task.id)).toBe("new body");
     });
 
     it("getTasks sorts by numeric task ID (task-10 after task-9)", () => {
@@ -180,6 +332,26 @@ describe("crew/store", () => {
       store.setTaskSpec(cwd, task.id, "# Task one\n\nConcrete spec");
       const savedSpec = store.getTaskSpec(cwd, task.id);
       expect(savedSpec).toBe("# Task one\n\nConcrete spec");
+    });
+
+    it("concurrent spec edits: the loser's generation precondition fails without overwriting", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one");
+
+      // Both writers built their transform from generation 0.
+      const first = store.applyTaskRevision(cwd, task.id, { spec: "first edit" }, { expectedGeneration: 0 });
+      expect(first?.generation).toBe(1);
+      expect(store.getTaskSpec(cwd, task.id)).toBe("first edit");
+
+      expect(() => store.applyTaskRevision(
+        cwd,
+        task.id,
+        { spec: "stale second edit" },
+        { expectedGeneration: 0 },
+      )).toThrow(store.StaleTaskGenerationError);
+
+      expect(store.getTaskSpec(cwd, task.id)).toBe("first edit");
+      expect(store.getTask(cwd, task.id)?.generation).toBe(1);
     });
   });
 
@@ -308,6 +480,69 @@ describe("crew/store", () => {
 
       store.resetTask(cwd, task.id);
       expect(fs.existsSync(blockFile)).toBe(false);
+    });
+
+    it("guarded reset does not clobber a task.start claim that lands after the orchestrator snapshot", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "Desc one");
+
+      // Orchestrator dispatch claim: todo + assigned to wave A.
+      const claimedA = store.claimTaskForDispatch(cwd, task.id, "WaveA-aaaa");
+      expect(claimedA?.status).toBe("todo");
+      expect(claimedA?.assigned_to).toBe("WaveA-aaaa");
+      expect(claimedA?.attempt_count).toBe(1);
+      const snapshot = store.getTask(cwd, task.id)!;
+
+      // Worker B (a separate pi process) takes the task over between the
+      // orchestrator's snapshot read and its reset write: the explicit reset
+      // invalidates A's reservation, then B claims and starts.
+      store.resetTask(cwd, task.id);
+      const claimedB = store.claimTaskForDispatch(cwd, task.id, "WaveB-bbbb");
+      expect(claimedB?.dispatch_token).toBeTruthy();
+      const started = store.startTask(cwd, task.id, "WaveB-bbbb", {
+        dispatchToken: claimedB!.dispatch_token,
+      });
+      expect(started?.status).toBe("in_progress");
+      expect(started?.assigned_to).toBe("WaveB-bbbb");
+
+      // The guarded reset re-reads under the per-task guard and must abort.
+      const reset = store.mutateTask(cwd, task.id, current =>
+        current.status === "todo" && current.assigned_to === snapshot.assigned_to
+          ? { status: "todo", assigned_to: undefined }
+          : null
+      );
+      expect(reset).toBeNull();
+
+      const after = store.getTask(cwd, task.id)!;
+      expect(after.status).toBe("in_progress");
+      expect(after.assigned_to).toBe("WaveB-bbbb");
+      expect(after.attempt_count).toBe(2);
+      expect(after.started_at).toBeDefined();
+    });
+
+    it("claimTaskForDispatch refuses to overwrite a concurrent claim", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "Desc one");
+      store.startTask(cwd, task.id, "WaveB-bbbb");
+
+      const lateClaim = store.claimTaskForDispatch(cwd, task.id, "WaveA-aaaa");
+      expect(lateClaim).toBeNull();
+
+      const after = store.getTask(cwd, task.id)!;
+      expect(after.status).toBe("in_progress");
+      expect(after.assigned_to).toBe("WaveB-bbbb");
+    });
+
+    it("updateTask refuses lifecycle fields so every lifecycle write is guarded", () => {
+      store.createPlan(cwd, "docs/PRD.md");
+      const task = store.createTask(cwd, "Task one", "Desc one");
+
+      for (const field of ["status", "assigned_to", "dispatch_token", "attempt_count", "completed_by", "completed_dispatch"]) {
+        expect(() => store.updateTask(cwd, task.id, { [field]: undefined } as never))
+          .toThrow(/cannot write lifecycle field/);
+      }
+      // Non-lifecycle fields still go through the generic guarded update.
+      expect(store.updateTask(cwd, task.id, { title: "Renamed" })?.title).toBe("Renamed");
     });
 
     it("resetTask(cascade: true) resets dependents recursively and syncs completed_count", () => {
@@ -551,7 +786,7 @@ describe("crew/store", () => {
       store.appendTaskProgress(cwd, task.id, "WorkerA", "Some work");
 
       const jsonPath = path.join(dirs.tasksDir, `${task.id}.json`);
-      const mdPath = path.join(dirs.tasksDir, `${task.id}.md`);
+      const mdPath = path.join(dirs.tasksDir, `${task.id}.spec.1.md`);
       const progressPath = path.join(dirs.tasksDir, `${task.id}.progress.md`);
       expect(fs.existsSync(jsonPath)).toBe(true);
       expect(fs.existsSync(mdPath)).toBe(true);

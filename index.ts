@@ -42,6 +42,7 @@ import {
   MAX_CHAT_HISTORY,
   formatRelativeTime,
   normalizeAgentMailMessage,
+  trustedMailedDispatchToken,
   stripAnsiCodes,
   extractFolder,
   generateAutoStatus,
@@ -136,6 +137,24 @@ export default function piMessengerExtension(pi: ExtensionAPI) {
   // ===========================================================================
 
   function deliverMessage(msg: AgentMailMessage): void {
+    // Warm lobby workers are spawned before their task claim, so this structured
+    // assignment is how their extension learns the dispatch reservation for
+    // task.done/block/unblock/reset fencing. The model never types it, and the
+    // token is accepted only when it matches the live reservation for the
+    // message's exact task AND this process is the warm lobby instance the
+    // orchestrator recorded. Cold workers ignore mailed tokens entirely: their
+    // spawn environment is the only token source.
+    if (msg.dispatchToken && process.env.PI_CREW_WORKER === "1") {
+      const cwd = state.cwd || process.cwd();
+      const accepted = trustedMailedDispatchToken(msg, {
+        isCrewWorker: true,
+        selfName: state.agentName || process.env.PI_AGENT_NAME,
+        lobbyId: process.env.PI_LOBBY_ID,
+        task: msg.taskId ? crewStore.getTask(cwd, msg.taskId) : null,
+      });
+      if (accepted) process.env.PI_CREW_DISPATCH = accepted;
+    }
+
     // Store in chat history (keyed by sender)
     let history = state.chatHistory.get(msg.from);
     if (!history) {

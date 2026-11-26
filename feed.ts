@@ -6,6 +6,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { acquireDirMutex, releaseDirMutex, tryAcquireDirMutex } from "./dir-mutex.ts";
 
 export type FeedEventType =
   | "join"
@@ -36,10 +37,17 @@ export type FeedEventType =
   | "plan.done"
   | "plan.cancel"
   | "plan.failed"
-  | "stuck";
+  | "stuck"
+  | "crew.idle";
 
 export interface FeedEvent {
   ts: string;
+  /**
+   * Monotonically increasing identity assigned at write time. The overlay
+   * advances its cursor on seq, so events sharing a timestamp are all seen.
+   * Absent on lines written before the field existed.
+   */
+  seq?: number;
   agent: string;
   type: FeedEventType;
   target?: string;
@@ -68,6 +76,9 @@ function sanitizeAgentName(value: string): string {
 export function sanitizeFeedEvent(event: FeedEvent): FeedEvent {
   return {
     ts: event.ts,
+    seq: typeof event.seq === "number" && Number.isFinite(event.seq) && event.seq >= 0
+      ? Math.trunc(event.seq)
+      : undefined,
     type: event.type,
     agent: sanitizeAgentName(event.agent),
     target: sanitizeInlineText(event.target),
@@ -75,17 +86,54 @@ export function sanitizeFeedEvent(event: FeedEvent): FeedEvent {
   };
 }
 
-export function appendFeedEvent(cwd: string, event: FeedEvent): void {
+/**
+ * Allocate the next feed sequence. Callers must hold the feed sequence guard
+ * so read-max + append is one critical section across processes.
+ */
+function nextFeedSeq(cwd: string): number {
+  // A short tail scan survives a malformed last line without restarting at 1.
+  const recent = readFeedEvents(cwd, 8);
+  let max = 0;
+  for (const event of recent) {
+    if (typeof event.seq === "number" && event.seq > max) max = event.seq;
+  }
+  return max + 1;
+}
+
+/**
+ * Append one event. Returns false when the best-effort append was skipped
+ * (e.g. feed-sequence guard timeout), so callers that own transition state can
+ * retry instead of recording an event that never landed.
+ */
+export function appendFeedEvent(cwd: string, event: FeedEvent): boolean {
   const p = feedPath(cwd);
   try {
     const feedDir = path.dirname(p);
     if (!fs.existsSync(feedDir)) {
       fs.mkdirSync(feedDir, { recursive: true });
     }
-    const sanitized = sanitizeFeedEvent(event);
-    fs.appendFileSync(p, JSON.stringify(sanitized) + "\n");
+
+    // Sequence allocation and the append are one critical section: two
+    // processes appending in the same millisecond must not share a seq, or the
+    // overlay cursor would skip one of them. If the guard cannot be acquired,
+    // defer/drop this best-effort event: computing a seq without the lock could
+    // mint a duplicate identity.
+    let guard: ReturnType<typeof acquireDirMutex>;
+    try {
+      guard = acquireDirMutex(path.join(feedDir, ".feed-seq"), { timeoutMs: 2000 });
+    } catch {
+      return false;
+    }
+    try {
+      const sanitized = sanitizeFeedEvent({ ...event, seq: nextFeedSeq(cwd) });
+      fs.appendFileSync(p, JSON.stringify(sanitized) + "\n");
+      return true;
+    } finally {
+      releaseDirMutex(guard);
+    }
   } catch {
     // Best effort
+    return false;
   }
 }
 
@@ -152,12 +200,23 @@ export function pruneFeed(cwd: string, maxEvents: number): void {
   if (!fs.existsSync(p)) return;
 
   try {
-    const content = fs.readFileSync(p, "utf-8").trim();
-    if (!content) return;
-    const lines = content.split("\n");
-    if (lines.length <= maxEvents) return;
-    const pruned = lines.slice(-maxEvents);
-    fs.writeFileSync(p, pruned.join("\n") + "\n");
+    // Prune must serialize with append on the same .feed-seq guard, otherwise
+    // a rewrite can erase an event that an appender just gave a fresh identity.
+    // On contention skip this prune entirely rather than writing unguarded.
+    const feedDir = path.dirname(p);
+    const guard = tryAcquireDirMutex(path.join(feedDir, ".feed-seq"));
+    if (!guard) return;
+
+    try {
+      const content = fs.readFileSync(p, "utf-8").trim();
+      if (!content) return;
+      const lines = content.split("\n");
+      if (lines.length <= maxEvents) return;
+      const pruned = lines.slice(-maxEvents);
+      fs.writeFileSync(p, pruned.join("\n") + "\n");
+    } finally {
+      releaseDirMutex(guard);
+    }
   } catch {
     // Best effort
   }
@@ -184,6 +243,7 @@ const CREW_EVENT_TYPES = new Set<FeedEventType>([
   "plan.done",
   "plan.cancel",
   "plan.failed",
+  "crew.idle",
 ]);
 
 export function formatFeedLine(event: FeedEvent): string {
@@ -242,6 +302,7 @@ export function formatFeedLine(event: FeedEvent): string {
     case "plan.cancel": line += " planning cancelled"; break;
     case "plan.failed": line += withPreview(" planning failed"); break;
     case "stuck": line += " appears stuck"; break;
+    case "crew.idle": line += withPreview(" went idle — outstanding work; run work to resume"); break;
     default: line += ` ${sanitized.type}`; break;
   }
   return line;
@@ -257,8 +318,8 @@ export function logFeedEvent(
   type: FeedEventType,
   target?: string,
   preview?: string
-): void {
-  appendFeedEvent(cwd, {
+): boolean {
+  return appendFeedEvent(cwd, {
     ts: new Date().toISOString(),
     agent,
     type,

@@ -18,8 +18,8 @@ describe("renderFeedSection (pure formatter)", () => {
     renderFeedSection = mod.renderFeedSection;
   });
 
-  function makeEvent(ts: string, type: string, agent = "agent-1"): FeedEvent {
-    return { ts, agent, type: type as FeedEvent["type"] };
+  function makeEvent(ts: string, type: string, agent = "agent-1", seq?: number): FeedEvent {
+    return { ts, seq, agent, type: type as FeedEvent["type"] };
   }
 
   it("returns empty for no events", () => {
@@ -38,24 +38,35 @@ describe("renderFeedSection (pure formatter)", () => {
     }
   });
 
-  it("highlights new events and dims old ones based on lastSeenTs", () => {
+  it("highlights new events and dims old ones based on lastSeenSeq", () => {
     const events = [
-      makeEvent("2026-01-01T00:00:00Z", "join"),
-      makeEvent("2026-01-01T00:01:00Z", "task.done"),
-      makeEvent("2026-01-01T00:02:00Z", "task.start"),
+      makeEvent("2026-01-01T00:00:00Z", "join", "agent-1", 1),
+      makeEvent("2026-01-01T00:01:00Z", "task.done", "agent-1", 2),
+      makeEvent("2026-01-01T00:02:00Z", "task.start", "agent-1", 3),
     ];
-    const lines = renderFeedSection(mockTheme as any, events, 80, "2026-01-01T00:00:30Z");
+    const lines = renderFeedSection(mockTheme as any, events, 80, 1);
     expect(lines[0]).toContain("[dim]");
     expect(lines[1]).not.toContain("[dim]");
     expect(lines[2]).not.toContain("[dim]");
   });
 
-  it("dims all events when lastSeenTs equals latest event ts", () => {
+  it("dims all events when lastSeenSeq equals the latest event seq", () => {
     const events = [
-      makeEvent("2026-01-01T00:01:00Z", "join"),
+      makeEvent("2026-01-01T00:01:00Z", "join", "agent-1", 4),
     ];
-    const lines = renderFeedSection(mockTheme as any, events, 80, "2026-01-01T00:01:00Z");
+    const lines = renderFeedSection(mockTheme as any, events, 80, 4);
     expect(lines[0]).toContain("[dim]");
+  });
+
+  it("uses seq identity, not timestamps: equal-ts events after the cursor are new", () => {
+    const ts = "2026-01-01T00:01:00.000Z";
+    const events = [
+      makeEvent(ts, "task.done", "agent-1", 7),
+      makeEvent(ts, "task.block", "agent-2", 8),
+    ];
+    const lines = renderFeedSection(mockTheme as any, events, 80, 7);
+    expect(lines[0]).toContain("[dim]");
+    expect(lines[1]).not.toContain("[dim]");
   });
 
   it("renders DM message with accent direction and body", () => {
@@ -130,7 +141,7 @@ describe("renderFeedSection (pure formatter)", () => {
       target: "OakBear",
       preview: "Hey there",
     }];
-    const lines = renderFeedSection(mockTheme as any, events, 80, "2026-01-01T00:01:00Z");
+    const lines = renderFeedSection(mockTheme as any, events, 80, 9);
     expect(lines.length).toBeGreaterThanOrEqual(1);
     const joined = lines.join(" ");
     expect(joined).toContain("EpicGrove");

@@ -45,7 +45,18 @@ describe("auto-review skips blocked/duplicate tasks", () => {
 
     vi.mocked(reviewHandler.reviewImplementation).mockResolvedValue({
       content: [{ type: "text", text: "Review" }],
-      details: { verdict: "SHIP" },
+      // reviewImplementation now returns the feedback instead of persisting it;
+      // the caller applies it in one guarded mutation.
+      details: {
+        verdict: "SHIP",
+        feedback: {
+          verdict: "SHIP",
+          summary: "Ship it",
+          issues: [],
+          suggestions: [],
+          reviewed_at: new Date().toISOString(),
+        },
+      },
     } as Awaited<ReturnType<typeof reviewHandler.reviewImplementation>>);
   });
 
@@ -65,17 +76,21 @@ describe("auto-review skips blocked/duplicate tasks", () => {
     });
   }
 
-  function workerResult(taskId: string) {
-    return { exitCode: 0, output: "", truncated: false, progress: { toolCallCount: 0, tokens: 0 }, agent: "crew-worker", taskId };
+  function workerResult(taskId: string, workerName: string) {
+    return { exitCode: 0, output: "", truncated: false, progress: { toolCallCount: 0, tokens: 0 }, agent: "crew-worker", taskId, workerName };
   }
 
   it("blocked task in succeeded list is not reviewed and gets a feed event", async () => {
     store.createPlan(cwd, "docs/PRD.md");
     const task = store.createTask(cwd, "Duplicated work", "Do work");
     blockAfterResultProcessing(task.id, "Duplicate of completed task-1");
-    vi.mocked(agents.spawnAgents).mockImplementation(async () => {
-      store.updateTask(cwd, task.id, { status: "done", completed_at: new Date().toISOString(), summary: "Done", base_commit: "abc123" });
-      return [workerResult(task.id)];
+    vi.mocked(agents.spawnAgents).mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      const claimed = store.claimTaskForDispatch(cwd, task.id, workerName);
+      store.startTask(cwd, task.id, workerName, { dispatchToken: claimed?.dispatch_token });
+      store.updateTask(cwd, task.id, { base_commit: "abc123" });
+      store.completeTask(cwd, task.id, "Done", undefined, workerName, { dispatchToken: claimed?.dispatch_token });
+      return [workerResult(task.id, workerName)];
     });
 
     const response = await workHandler.execute({}, dirs, createMockContext(cwd), vi.fn());
@@ -100,9 +115,13 @@ describe("auto-review skips blocked/duplicate tasks", () => {
     store.createPlan(cwd, "docs/PRD.md");
     const task = store.createTask(cwd, "Duplicate work", "Do work");
     // Task stays status "done" but carries a stale duplicate blocked_reason
-    vi.mocked(agents.spawnAgents).mockImplementation(async () => {
-      store.updateTask(cwd, task.id, { status: "done", completed_at: new Date().toISOString(), summary: "Done", base_commit: "abc123" });
-      return [workerResult(task.id)];
+    vi.mocked(agents.spawnAgents).mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      const claimed = store.claimTaskForDispatch(cwd, task.id, workerName);
+      store.startTask(cwd, task.id, workerName, { dispatchToken: claimed?.dispatch_token });
+      store.updateTask(cwd, task.id, { base_commit: "abc123" });
+      store.completeTask(cwd, task.id, "Done", undefined, workerName, { dispatchToken: claimed?.dispatch_token });
+      return [workerResult(task.id, workerName)];
     });
     const responsePromise = workHandler.execute({}, dirs, createMockContext(cwd), vi.fn());
     // Block as duplicate right before the dispatch loop reads it again
@@ -124,12 +143,65 @@ describe("auto-review skips blocked/duplicate tasks", () => {
     expect(updated.review_count ?? 0).toBe(0);
   });
 
+  it("duplicate skip does not block a newer completion that landed before the blocking write", async () => {
+    store.createPlan(cwd, "docs/PRD.md");
+    const task = store.createTask(cwd, "Duplicate work", "Do work");
+
+    vi.mocked(agents.spawnAgents).mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      const a = store.claimTaskForDispatch(cwd, task.id, workerName)!;
+      store.startTask(cwd, task.id, workerName, { dispatchToken: a.dispatch_token });
+      store.updateTask(cwd, task.id, { base_commit: "abc123" });
+      store.completeTask(cwd, task.id, "A landed", undefined, workerName, { dispatchToken: a.dispatch_token });
+      // Stale duplicate marker remains on the completed task.
+      store.updateTask(cwd, task.id, { blocked_reason: "Duplicate of completed task-9" });
+      return [workerResult(task.id, workerName)];
+    });
+
+    const originalBlock = store.blockTask.bind(store);
+    let swapped = false;
+    const blockSpy = vi.spyOn(store, "blockTask").mockImplementation(((
+      taskCwd: string,
+      taskId: string,
+      reason: string,
+      fence?: Parameters<typeof store.blockTask>[3],
+    ) => {
+      if (!swapped && taskId === task.id && fence?.expectedStatus === "done") {
+        swapped = true;
+        // A newer worker takes over and completes before this stale duplicate
+        // branch's blocking mutation runs.
+        store.resetTask(taskCwd, taskId);
+        const b = store.claimTaskForDispatch(taskCwd, taskId, "WorkerB")!;
+        store.startTask(taskCwd, taskId, "WorkerB", { dispatchToken: b.dispatch_token });
+        store.completeTask(taskCwd, taskId, "B landed", undefined, "WorkerB", { dispatchToken: b.dispatch_token });
+      }
+      return originalBlock(taskCwd, taskId, reason, fence);
+    }) as typeof store.blockTask);
+
+    try {
+      const response = await workHandler.execute({}, dirs, createMockContext(cwd), vi.fn());
+      expect(swapped).toBe(true);
+      expect(response.details.blocked ?? []).not.toContain(task.id);
+    } finally {
+      blockSpy.mockRestore();
+    }
+
+    const updated = store.getTask(cwd, task.id)!;
+    expect(updated.status).toBe("done");
+    expect(updated.completed_by).toBe("WorkerB");
+    expect(updated.review_count ?? 0).toBe(0);
+  });
+
   it("healthy done tasks are still reviewed (no over-skipping)", async () => {
     store.createPlan(cwd, "docs/PRD.md");
     const task = store.createTask(cwd, "Healthy work", "Do work");
-    vi.mocked(agents.spawnAgents).mockImplementation(async () => {
-      store.updateTask(cwd, task.id, { status: "done", completed_at: new Date().toISOString(), summary: "Done", base_commit: "abc123" });
-      return [workerResult(task.id)];
+    vi.mocked(agents.spawnAgents).mockImplementation(async (tasks: Array<{ taskId?: string; workerName?: string }>) => {
+      const workerName = tasks[0]?.workerName!;
+      const claimed = store.claimTaskForDispatch(cwd, task.id, workerName);
+      store.startTask(cwd, task.id, workerName, { dispatchToken: claimed?.dispatch_token });
+      store.updateTask(cwd, task.id, { base_commit: "abc123" });
+      store.completeTask(cwd, task.id, "Done", undefined, workerName, { dispatchToken: claimed?.dispatch_token });
+      return [workerResult(task.id, workerName)];
     });
 
     const response = await workHandler.execute({}, dirs, createMockContext(cwd), vi.fn());

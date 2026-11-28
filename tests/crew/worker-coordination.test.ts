@@ -526,7 +526,7 @@ describe("executeSend broadcast filtering", () => {
       timestamp: new Date().toISOString(),
       replyTo: null,
     }));
-    vi.spyOn(feedModule, "logFeedEvent").mockImplementation(() => {});
+    vi.spyOn(feedModule, "logFeedEvent").mockReturnValue(true);
   });
 
   afterEach(() => {

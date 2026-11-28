@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Task } from "../../crew/types.ts";
 
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(() => {
@@ -336,12 +337,19 @@ describe("lobby workers", () => {
     worker.assignedTaskId = "task-1";
     worker.dispatchToken = "warm-dispatch-token";
 
+    const task: Task = {
+      id: "task-1", title: "Test", status: "todo", attempt_count: 1,
+      depends_on: [], created_at: "", updated_at: "", base_commit: "abc1234",
+    };
     vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({
       outcome: "todo",
-      task: {
-        id: "task-1", title: "Test", status: "todo", attempt_count: 1,
-        depends_on: [], created_at: "", base_commit: "abc1234",
-      } as any,
+      task,
+      previous: {
+        ...task,
+        status: "in_progress",
+        assigned_to: worker.name,
+        dispatch_token: worker.dispatchToken,
+      },
     });
 
     const proc = worker.proc as any;
@@ -418,7 +426,9 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-3";
 
-    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({ outcome: "changed", task: null });
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({
+      outcome: "changed", task: null, previous: null, reason: "status_done",
+    });
 
     const proc = worker.proc as any;
     proc._handlers["close"](0);
@@ -438,7 +448,9 @@ describe("lobby workers", () => {
     const worker = lobby.spawnLobbyWorker("/test/cwd")!;
     worker.assignedTaskId = "task-4";
 
-    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({ outcome: "changed", task: null });
+    vi.mocked(storeModule.exitAttempt).mockReturnValueOnce({
+      outcome: "changed", task: null, previous: null, reason: "owner_mismatch",
+    });
 
     const proc = worker.proc as any;
     proc._handlers["close"](0);
@@ -576,11 +588,23 @@ describe("lobby workers", () => {
   it("builds minimal lobby prompt without chat instructions", async () => {
     const config = await import("../../crew/utils/config.ts");
     vi.mocked(config.loadCrewConfig).mockReturnValue({
-      concurrency: { workers: 4 },
+      concurrency: { workers: 4, max: 10 },
       models: {},
-      artifacts: { enabled: false },
-      work: {},
+      truncation: {
+        planners: { bytes: 204800, lines: 5000 },
+        workers: { bytes: 204800, lines: 5000 },
+        reviewers: { bytes: 102400, lines: 2000 },
+        analysts: { bytes: 102400, lines: 2000 },
+      },
+      artifacts: { enabled: false, cleanupDays: 7 },
+      memory: { enabled: false },
+      planSync: { enabled: false },
+      review: { enabled: true, maxIterations: 3 },
+      planning: { maxPasses: 1 },
+      work: { maxAttemptsPerTask: 5, maxWaves: 50, stopOnBlock: false },
+      dependencies: "advisory",
       coordination: "minimal",
+      messageBudgets: { none: 0, minimal: 2, moderate: 5, chatty: 10 },
     });
 
     const { spawn } = await import("node:child_process");

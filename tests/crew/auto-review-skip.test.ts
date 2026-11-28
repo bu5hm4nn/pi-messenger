@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Dirs } from "../../lib.ts";
 import { createTempCrewDirs } from "../helpers/temp-dirs.ts";
 import { createMockContext } from "../helpers/mock-context.ts";
+import { makeAgentProgress } from "../helpers/agent-progress.ts";
 
 vi.mock("../../crew/agents.ts", () => ({
   spawnAgents: vi.fn(),
@@ -77,7 +78,7 @@ describe("auto-review skips blocked/duplicate tasks", () => {
   }
 
   function workerResult(taskId: string, workerName: string) {
-    return { exitCode: 0, output: "", truncated: false, progress: { toolCallCount: 0, tokens: 0 }, agent: "crew-worker", taskId, workerName };
+    return { exitCode: 0, output: "", truncated: false, progress: makeAgentProgress(), agent: "crew-worker", taskId, workerName };
   }
 
   it("blocked task in succeeded list is not reviewed and gets a feed event", async () => {

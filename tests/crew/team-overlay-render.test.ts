@@ -114,7 +114,7 @@ describe("Crew idle overlay flash", () => {
     const overlay = createOverlay(cwd);
     try {
       // Empty first render establishes a zero baseline.
-      overlay.render();
+      overlay.render(overlay.width);
       const viewState = (overlay as any).crewViewState as ReturnType<typeof createCrewViewState>;
       expect(viewState.lastSeenEventSeq).toBe(0);
 
@@ -123,16 +123,16 @@ describe("Crew idle overlay flash", () => {
 
       // Render BETWEEN the two equal-timestamp appends: the first event must
       // advance the cursor before the second is written.
-      overlay.render();
+      overlay.render(overlay.width);
       expect(viewState.notification?.message).toContain("completed");
 
       appendFeedEvent(cwd, { ts, agent: "crew", type: "crew.idle", preview: "outstanding work" });
-      overlay.render();
+      overlay.render(overlay.width);
       // The later idle event is not suppressed by its equal timestamp; it
       // queues behind the still-visible done flash and then actually displays.
       expect(viewState.pendingNotifications.join(" ")).toContain("crew idle");
       vi.advanceTimersByTime(2001);
-      overlay.render();
+      overlay.render(overlay.width);
       expect(viewState.notification?.message).toContain("crew idle");
     } finally {
       overlay.dispose();
@@ -154,7 +154,7 @@ describe("Crew idle overlay flash", () => {
 
     const overlay = createOverlay(cwd);
     try {
-      overlay.render();
+      overlay.render(overlay.width);
       const viewState = (overlay as any).crewViewState as ReturnType<typeof createCrewViewState>;
       expect(viewState.lastSeenEventSeq).toBe(0);
 
@@ -165,7 +165,7 @@ describe("Crew idle overlay flash", () => {
         target: "task-1",
       });
 
-      overlay.render();
+      overlay.render(overlay.width);
       expect(viewState.notification?.message).toContain("completed");
     } finally {
       overlay.dispose();

@@ -2,7 +2,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { vi } from "vitest";
 
 export function createMockContext(cwd: string = process.cwd()): ExtensionContext {
-  return {
+  // The handlers under test only use this subset of the SDK context.
+  const context = {
     hasUI: true,
     cwd,
     ui: {
@@ -12,11 +13,14 @@ export function createMockContext(cwd: string = process.cwd()): ExtensionContext
       notify: vi.fn(),
       setStatus: vi.fn(),
       custom: vi.fn(),
-    } as ExtensionContext["ui"],
+    } satisfies Pick<ExtensionContext["ui"], "notify" | "setStatus" | "custom"> & {
+      theme: Pick<ExtensionContext["ui"]["theme"], "fg">;
+    },
     sessionManager: {
       getEntries: () => [],
       getSessionId: () => "test-session",
-    } as ExtensionContext["sessionManager"],
+    } satisfies Pick<ExtensionContext["sessionManager"], "getEntries" | "getSessionId">,
     model: "test-model",
-  } as unknown as ExtensionContext;
+  };
+  return context as unknown as ExtensionContext;
 }

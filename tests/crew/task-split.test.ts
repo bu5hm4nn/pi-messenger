@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessengerState } from "../../lib.ts";
 import * as store from "../../crew/store.ts";
 import * as taskHandler from "../../crew/handlers/task.ts";
+import type { Task } from "../../crew/types.ts";
 import { createMockContext } from "../helpers/mock-context.ts";
 import { createTempCrewDirs, type TempCrewDirs } from "../helpers/temp-dirs.ts";
 
@@ -69,7 +70,8 @@ describe("crew/task.split", () => {
 
     expect(response.details.mode).toBe("task.split");
     expect(response.details.phase).toBe("execute");
-    const subtaskIds = response.details.subtasks.map((t: { id: string }) => t.id);
+    const subtasks = response.details.subtasks as Pick<Task, "id" | "title">[];
+    const subtaskIds = subtasks.map(t => t.id);
     expect(subtaskIds).toHaveLength(2);
 
     const reloadedParent = store.getTask(cwd, parent.id);
@@ -141,8 +143,8 @@ describe("crew/task.split", () => {
     const originalCreate = store.createTask.bind(store);
     let injected = false;
     let statusAfterAutoComplete: string | undefined;
-    let claimedDuringSplit: store.Task | null = null;
-    let startedDuringSplit: store.Task | null = null;
+    let claimedDuringSplit: Task | null = null;
+    let startedDuringSplit: Task | null = null;
     let response: Awaited<ReturnType<typeof taskHandler.execute>>;
 
     const spy = vi.spyOn(store, "createTask").mockImplementation(((
@@ -189,9 +191,8 @@ describe("crew/task.split", () => {
     expect(reloaded.milestone).toBe(true);
     expect(reloaded.status).toBe("todo");
     expect(reloaded.pending_split).toBeUndefined();
-    expect(reloaded.depends_on).toEqual(
-      response.details.subtasks.map((t: { id: string }) => t.id),
-    );
+    const subtasks = response.details.subtasks as Pick<Task, "id" | "title">[];
+    expect(reloaded.depends_on).toEqual(subtasks.map(t => t.id));
   });
 
   it("rolls back a refused split and removes untouched subtasks", async () => {

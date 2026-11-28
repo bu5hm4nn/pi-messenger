@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createTempCrewDirs } from "../helpers/temp-dirs.ts";
+import { makeAgentProgress } from "../helpers/agent-progress.ts";
 
 vi.mock("../../crew/agents.ts", () => ({
   spawnAgents: vi.fn(),
@@ -42,7 +43,7 @@ describe("executeReviseTree", () => {
     const t1 = store.createTask(tmpDir, "Root task");
     liveProgress.updateLiveWorker(tmpDir, "__reviser__", {
       taskId: "__reviser__", agent: "p", name: "R",
-      progress: { toolCallCount: 0, tokens: 0, currentTool: undefined, currentToolArgs: undefined, recentTools: [] },
+      progress: makeAgentProgress({ status: "running", currentTool: undefined, currentToolArgs: undefined }),
       startedAt: Date.now(),
     });
     const r = await executeReviseTree(tmpDir, t1.id, undefined, "agent");
@@ -75,7 +76,7 @@ describe("executeReviseTree", () => {
     store.startTask(tmpDir, t2.id, "worker");
     liveProgress.updateLiveWorker(tmpDir, t2.id, {
       taskId: t2.id, agent: "p", name: "W",
-      progress: { toolCallCount: 0, tokens: 0, currentTool: undefined, currentToolArgs: undefined, recentTools: [] },
+      progress: makeAgentProgress({ status: "running", currentTool: undefined, currentToolArgs: undefined }),
       startedAt: Date.now(),
     });
     const r = await executeReviseTree(tmpDir, t1.id, undefined, "agent");
@@ -100,7 +101,7 @@ describe("executeReviseTree", () => {
 ]
 \`\`\``,
       error: null,
-      progress: { toolCallCount: 0, tokens: 0 },
+      progress: makeAgentProgress(),
     }]);
 
     const r = await executeReviseTree(tmpDir, t1.id, "improve", "agent");
@@ -127,7 +128,7 @@ describe("executeReviseTree", () => {
 ]
 \`\`\``,
       error: null,
-      progress: { toolCallCount: 0, tokens: 0 },
+      progress: makeAgentProgress(),
     }]);
 
     const originalReset = store.resetTask.bind(store);
@@ -173,7 +174,7 @@ describe("executeReviseTree", () => {
 ]
 \`\`\``,
       error: null,
-      progress: { toolCallCount: 0, tokens: 0 },
+      progress: makeAgentProgress(),
     }]);
 
     const r = await executeReviseTree(tmpDir, t1.id, undefined, "agent");
@@ -198,7 +199,7 @@ describe("executeReviseTree", () => {
 ]
 \`\`\``,
       error: null,
-      progress: { toolCallCount: 0, tokens: 0 },
+      progress: makeAgentProgress(),
     }]);
 
     const r = await executeReviseTree(tmpDir, t1.id, undefined, "agent");

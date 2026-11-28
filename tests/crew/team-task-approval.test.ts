@@ -5,6 +5,7 @@ import type { MessengerState } from "../../lib.ts";
 import * as taskHandler from "../../crew/handlers/task.ts";
 import * as store from "../../crew/store.ts";
 import * as teamStore from "../../crew/team/store.ts";
+import type { Task } from "../../crew/types.ts";
 import { createMockContext } from "../helpers/mock-context.ts";
 import { createTempCrewDirs } from "../helpers/temp-dirs.ts";
 
@@ -49,7 +50,8 @@ describe("Team task approval gates", () => {
       createMockContext(cwd),
     );
 
-    expect(created.details.task.approval).toEqual({ required: true, status: "pending" });
+    const task = created.details.task as Pick<Task, "approval">;
+    expect(task.approval).toEqual({ required: true, status: "pending" });
     expect(created.content[0].text).toContain("Approve first");
   });
 
@@ -65,8 +67,9 @@ describe("Team task approval gates", () => {
       createState(),
       createMockContext(cwd),
     );
-    expect(canonical.details.task.role).toBe("scout");
-    expect(canonical.details.task.approval).toBeUndefined();
+    const task = canonical.details.task as Pick<Task, "role" | "approval">;
+    expect(task.role).toBe("scout");
+    expect(task.approval).toBeUndefined();
 
     const invalid = await taskHandler.execute(
       "create",
@@ -88,9 +91,10 @@ describe("Team task approval gates", () => {
 
     const list = await taskHandler.execute("list", {}, createState(), createMockContext(cwd));
     expect(list.content[0].text).toContain("[worker] [risk: auth] [approval: pending]");
-    expect(list.details.tasks[0].role).toBe("worker");
-    expect(list.details.tasks[0].risk_labels).toEqual(["auth"]);
-    expect(list.details.tasks[0].approval).toEqual({ required: true, status: "pending" });
+    const tasks = list.details.tasks as Pick<Task, "role" | "risk_labels" | "approval">[];
+    expect(tasks[0].role).toBe("worker");
+    expect(tasks[0].risk_labels).toEqual(["auth"]);
+    expect(tasks[0].approval).toEqual({ required: true, status: "pending" });
 
     const show = await taskHandler.execute("show", { id: gated.id }, createState(), createMockContext(cwd));
     expect(show.content[0].text).toContain("[worker] [risk: auth] [approval: pending]");
@@ -124,11 +128,13 @@ describe("Team task approval gates", () => {
     });
 
     const approval = await taskHandler.execute("approve", { id: gated.id }, createState("Lead"), createMockContext(cwd));
-    expect(approval.details.task.approval.status).toBe("approved");
-    expect(approval.details.task.approval.decided_by).toBe("Lead");
+    const approvedTask = approval.details.task as Pick<Task, "approval">;
+    expect(approvedTask.approval.status).toBe("approved");
+    expect(approvedTask.approval.decided_by).toBe("Lead");
 
     const start = await taskHandler.execute("start", { id: gated.id }, createState("Worker"), createMockContext(cwd));
-    expect(start.details.task.status).toBe("in_progress");
+    const startedTask = start.details.task as Pick<Task, "status">;
+    expect(startedTask.status).toBe("in_progress");
   });
 
   it("clears stale rejection feedback when approving without new feedback", async () => {
@@ -140,8 +146,9 @@ describe("Team task approval gates", () => {
 
     const approval = await taskHandler.execute("approve", { id: gated.id }, createState("Lead"), createMockContext(cwd));
 
-    expect(approval.details.task.approval.status).toBe("approved");
-    expect(approval.details.task.approval.feedback).toBeUndefined();
+    const approvedTask = approval.details.task as Pick<Task, "approval">;
+    expect(approvedTask.approval.status).toBe("approved");
+    expect(approvedTask.approval.feedback).toBeUndefined();
   });
 
   it("rejects approval changes after work starts or finishes", async () => {
@@ -198,7 +205,8 @@ describe("Team task approval gates", () => {
       createMockContext(cwd),
     );
 
-    const subtaskIds = split.details.subtasks.map((task: { id: string }) => task.id);
+    const subtasks = split.details.subtasks as Pick<Task, "id" | "title">[];
+    const subtaskIds = subtasks.map(task => task.id);
     for (const subtaskId of subtaskIds) {
       const subtask = store.getTask(cwd, subtaskId);
       expect(subtask?.role).toBe("worker");
